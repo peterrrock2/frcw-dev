@@ -415,7 +415,7 @@ impl StatsWriter for CanonicalWriter {
                     "{}\n",
                     json!({
                         "assignment": self.previous_assignment,
-                        "sample": step+1,
+                        "sample": step,
                     })
                 )
                 .as_bytes(),

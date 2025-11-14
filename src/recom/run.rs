@@ -310,7 +310,7 @@ pub fn multi_chain(
     n_threads: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let mut step = 0;
+    let mut step = 1; // Since people expect the number of outputs to equal n_steps
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![]; // main thread sends work to job threads
     let mut job_recvs = vec![]; // job threads receive work from main thread
@@ -364,7 +364,8 @@ pub fn multi_chain(
             }
         }
         let mut sampled = SelfLoopCounts::default();
-        while step <= params.num_steps {
+        let mut previously_accepted_proposal: Option<RecomProposal> = None;
+        while step < params.num_steps {
             let mut counts = SelfLoopCounts::default();
             let mut proposals = Vec::<(u64, RecomProposal)>::new();
             // This is where the proposals are assigned
@@ -380,7 +381,7 @@ pub fn multi_chain(
                 proposals.sort_by(|a, b| a.0.cmp(&b.0));
 
                 let mut total = loops + proposals.len();
-                while total > 0 {
+                while total > 0 && step < params.num_steps {
                     step += 1;
                     let event = rng.random_range(0..total);
                     if event < loops {
@@ -406,6 +407,7 @@ pub fn multi_chain(
                             .unwrap();
                         // Reset sampled rejection stats until the next accepted step.
                         sampled = SelfLoopCounts::default();
+                        previously_accepted_proposal = Some(proposal.1.clone());
                         break;
                     }
                     total -= 1;
@@ -413,6 +415,16 @@ pub fn multi_chain(
             } else {
                 sampled = sampled + counts;
                 step += loops as u64;
+                if step >= params.num_steps as u64 && previously_accepted_proposal.is_some() {
+                    stats_send
+                        .send(StepPacket {
+                            step: step,
+                            proposal: previously_accepted_proposal.clone(),
+                            counts: sampled.clone(),
+                            terminate: true,
+                        })
+                        .unwrap();
+                }
                 for job in job_sends.iter() {
                     next_batch(job, None, batch_size);
                 }
@@ -424,8 +436,13 @@ pub fn multi_chain(
             stop_job_thread(job);
         }
         stop_stats_thread(&stats_send);
-    })
-    .unwrap();
+        if previously_accepted_proposal.is_none() {
+            return Err("No proposals were accepted during the entire chain run. \
+                This likely indicates that either the run was too short (so increase the value \
+                of 'n-steps') or that the ReCom variant being used is too restrictive for the \
+                graph and parameters chosen."
+                .to_owned());
+        }
         Ok(())
     });
 
