@@ -262,9 +262,12 @@ fn main() {
         None => (graph.total_pop as f64) / (partition.num_dists as f64),
     };
 
+    // NOTE: We have to round towards the target_pop here so that a population tolerance
+    // of 0.000001 on a graph with a small target population (e.g., 10) does not allow in
+    // districts with 9 people in them.
     let params = RecomParams {
-        min_pop: ((1.0 - tol) * avg_pop as f64).floor() as u32,
-        max_pop: ((1.0 + tol) * avg_pop as f64).ceil() as u32,
+        min_pop: ((1.0 - tol) * target_pop as f64).ceil() as u32,
+        max_pop: ((1.0 + tol) * target_pop as f64).floor() as u32,
         num_steps: n_steps,
         rng_seed: rng_seed,
         balance_ub: balance_ub,
