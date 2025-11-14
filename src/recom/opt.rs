@@ -181,8 +181,8 @@ pub fn multi_short_bursts(
     obj_fn: impl Fn(&Graph, &Partition) -> ScoreValue + Send + Clone + Copy,
     burst_length: usize,
     verbose: bool,
-) -> Partition {
-    let mut step = 0;
+) -> Result<Partition, String> {
+    let mut step = 1;
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![]; // main thread sends work to job threads
     let mut job_recvs = vec![]; // job threads receive work from main thread
@@ -196,7 +196,7 @@ pub fn multi_short_bursts(
         unbounded();
     let mut score = obj_fn(&graph, &partition);
 
-    scope(|scope| {
+    let scoped_result = scope(|scope| -> Result<Partition, String> {
         // Start optimization threads.
         for t_idx in 0..n_threads {
             // TODO: is this (+ t_idx) a sensible way to seed?
@@ -225,7 +225,7 @@ pub fn multi_short_bursts(
             }
         }
 
-        while step <= params.num_steps {
+        while step < params.num_steps {
             let mut diff = None;
             for _ in 0..n_threads {
                 let packet: OptResultPacket = result_recv.recv().unwrap();
@@ -252,7 +252,13 @@ pub fn multi_short_bursts(
         for job in job_sends.iter() {
             stop_opt_thread(job);
         }
-        partition
-    })
-    .unwrap()
+        Ok(partition)
+    });
+
+    match scoped_result {
+        Ok(inner) => inner, // inner: Result<Partition, String>
+
+        // This only happens if some thread panicked.
+        Err(_panic) => Err("multi_chain panicked in a worker thread".to_string()),
+    }
 }

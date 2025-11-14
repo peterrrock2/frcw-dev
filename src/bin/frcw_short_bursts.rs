@@ -3,7 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::{value_t, App, Arg};
+use clap::{value_parser, Arg, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::graph::Graph;
 use frcw::init::from_networkx;
@@ -74,116 +74,168 @@ fn make_objective_fn(
 }
 
 fn main() {
-    let cli = App::new("frcw_short_bursts")
-        .version("0.1.0")
+    let cli = Command::new("frcw_short_bursts")
+        .version("0.1.3")
         .author("Parker J. Rule <parker.rule@tufts.edu>")
         .about("A short bursts optimizer for redistricting")
         .arg(
-            Arg::with_name("graph_json")
+            Arg::new("graph_json")
                 .long("graph-json")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The path of the dual graph (in NetworkX format)."),
         )
         .arg(
-            Arg::with_name("n_steps")
+            Arg::new("n_steps")
                 .long("n-steps")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(u64))
                 .help("The number of proposals to generate."),
         )
         .arg(
-            Arg::with_name("tol")
+            Arg::new("tol")
                 .long("tol")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(f64))
                 .help("The relative population tolerance."),
         )
         .arg(
-            Arg::with_name("pop_col")
+            Arg::new("pop_col")
                 .long("pop-col")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The name of the total population column in the graph metadata."),
         )
         .arg(
-            Arg::with_name("assignment_col")
+            Arg::new("assignment_col")
                 .long("assignment-col")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The name of the assignment column in the graph metadata."),
         )
         .arg(
-            Arg::with_name("rng_seed")
+            Arg::new("rng_seed")
                 .long("rng-seed")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(u64))
                 .help("The seed of the RNG used to draw proposals."),
         )
         .arg(
-            Arg::with_name("n_threads")
+            Arg::new("n_threads")
                 .long("n-threads")
-                .takes_value(true)
-                .required(true)
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("1")
                 .help("The number of threads to use."),
         )
         .arg(
-            Arg::with_name("burst_length")
+            Arg::new("burst_length")
                 .long("burst-length")
-                .takes_value(true)
+                .value_parser(value_parser!(usize))
                 .required(true)
                 .help("The number of accepted steps per short burst."),
         )
         .arg(
-            Arg::with_name("sum_cols")
+            Arg::new("sum_cols")
                 .long("sum-cols")
-                .multiple(true)
-                .takes_value(true),
+                .value_parser(value_parser!(Option<String>))
+                .num_args(1..)
+                .default_value(None)
+                .help("Additional columns in the graph metadata to sum over districts."),
         )
         .arg(
-            Arg::with_name("objective")
+            Arg::new("objective")
                 .long("objective")
-                .takes_value(true)
                 .required(true)
                 .help("A JSON-formatted objective function configuration>"),
         )
         .arg(
-            Arg::with_name("region_weights")
+            Arg::new("region_weights")
                 .long("region-weights")
-                .takes_value(true)
-                .help("Region columns with weights for region-aware ReCom."),
+                .value_parser(value_parser!(String))
+                .default_value("")
+                .help(
+                    "Region columns with weights for region-aware ReCom. \
+                    Must be entered into the command line using the format:\n\
+                    \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'",
+                ),
         );
+
     let matches = cli.get_matches();
-    let n_steps = value_t!(matches.value_of("n_steps"), u64).unwrap_or_else(|e| e.exit());
-    let n_threads = value_t!(matches.value_of("n_threads"), usize).unwrap_or_else(|e| e.exit());
-    let rng_seed = value_t!(matches.value_of("rng_seed"), u64).unwrap_or_else(|e| e.exit());
-    let tol = value_t!(matches.value_of("tol"), f64).unwrap_or_else(|e| e.exit());
-    let burst_length =
-        value_t!(matches.value_of("burst_length"), usize).unwrap_or_else(|e| e.exit());
-    let graph_json = fs::canonicalize(PathBuf::from(matches.value_of("graph_json").unwrap()))
-        .unwrap()
+
+    let n_steps = *matches
+        .get_one::<u64>("n_steps")
+        .expect("n_steps is required");
+    let n_threads = *matches
+        .get_one::<usize>("n_threads")
+        .expect("n_threads is required");
+    let rng_seed = *matches
+        .get_one::<u64>("rng_seed")
+        .expect("rng_seed is required");
+    let tol = *matches.get_one::<f64>("tol").expect("tol is required");
+    let burst_length = *matches
+        .get_one::<usize>("burst_length")
+        .expect("burst_length is required");
+
+    let graph_path = matches
+        .get_one::<String>("graph_json")
+        .expect("graph_json is required");
+    let graph_path_buf = PathBuf::from(graph_path);
+    let graph_json = match fs::canonicalize(&graph_path_buf)
+        .map_err(|e| format!("Could not canonicalize path {:?}: {e}", graph_path_buf))
+        .expect(format!("Could not create fs buffer from {graph_path}").as_str())
         .into_os_string()
         .into_string()
-        .unwrap();
-    let pop_col = matches.value_of("pop_col").unwrap();
-    let assignment_col = matches.value_of("assignment_col").unwrap();
-    let sum_cols = matches
-        .values_of("sum_cols")
+        .map_err(|_| {
+            format!(
+                "path for --graph-jaon is not valid UTF-8: {:?}",
+                graph_path_buf
+            )
+        }) {
+        Ok(s) => s,
+        Err(e) => panic!("{}", e),
+    };
+
+    let pop_col = matches
+        .get_one::<String>("pop_col")
+        .expect("pop_col is required")
+        .as_str();
+    let assignment_col = matches
+        .get_one::<String>("assignment_col")
+        .expect("assignment_col is required")
+        .as_str();
+    let mut sum_cols: Vec<String> = matches
+        .get_many::<String>("sum_cols")
         .unwrap_or_default()
         .map(|c| c.to_string())
         .collect();
-    let objective_config = matches.value_of("objective").unwrap();
-    let objective_fn = make_objective_fn(objective_config);
-    let region_weights_raw = matches.value_of("region_weights").unwrap_or_default();
+    let region_weights_raw = (*matches.get_one::<String>("region_weights").unwrap()).as_str();
     let region_weights = parse_region_weights_config(region_weights_raw);
+    // Add the keys in the region weights to sum_cols if they are not there already
+    // so that the user doesn't have to
+    if let Some(weight_pairs_vec) = &region_weights {
+        for (key, _) in weight_pairs_vec.iter() {
+            if !sum_cols.contains(&key) {
+                sum_cols.push(key.clone().to_string());
+            }
+        }
+    }
 
-    assert!(tol >= 0.0 && tol <= 1.0);
+    let objective_config = matches
+        .get_one::<String>("objective")
+        .expect("objective is required")
+        .as_str();
+    let objective_fn = make_objective_fn(objective_config);
+
+    if tol < 0.0 || tol > 1.0 {
+        panic!("Parameter error: '--tol' must be between 0 and 1.");
+    }
 
     let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols).unwrap();
     let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
     let params = RecomParams {
-        min_pop: ((1.0 - tol) * avg_pop as f64).floor() as u32,
-        max_pop: ((1.0 + tol) * avg_pop as f64).ceil() as u32,
+        min_pop: ((1.0 - tol) * avg_pop as f64).ceil() as u32,
+        max_pop: ((1.0 + tol) * avg_pop as f64).floor() as u32,
         num_steps: n_steps,
         rng_seed: rng_seed,
         balance_ub: 0,
@@ -218,7 +270,7 @@ fn main() {
             .insert("region_weights".to_string(), json!(region_weights));
     }
     println!("{}", json!({ "meta": meta }).to_string());
-    multi_short_bursts(
+    let output = multi_short_bursts(
         &graph,
         partition,
         &params,
@@ -227,4 +279,18 @@ fn main() {
         burst_length,
         true,
     );
+
+    match output {
+        Ok(final_partition) => {
+            let final_score = objective_fn(&graph, &final_partition);
+            let output = json!({
+                "final_score": final_score,
+                "final_assignment": final_partition.assignments
+            });
+            println!("{}", output.to_string());
+        }
+        Err(e) => {
+            eprintln!("Error during optimization: {}", e);
+        }
+    }
 }

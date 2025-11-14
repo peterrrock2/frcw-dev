@@ -98,7 +98,7 @@ mod ust {
             buf.clear();
             self.ust_buf.clear();
             let n = graph.pops.len();
-            let root = rng.gen_range(0..n);
+            let root = rng.random_range(0..n);
             self.ust_buf.in_tree[root] = true;
             for i in 0..n {
                 let mut u = i;

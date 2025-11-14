@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ops::Add;
 
 /// Reasons why a self-loop occurred in a Markov chain.
-#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
 pub enum SelfLoopReason {
     /// Drew non-adjacent district pairs.
     NonAdjacent,
@@ -17,6 +17,7 @@ pub enum SelfLoopReason {
 }
 
 /// Self-loop statistics since the last accepted proposal.
+#[derive(Clone, Debug)]
 pub struct SelfLoopCounts {
     counts: HashMap<SelfLoopReason, usize>,
 }

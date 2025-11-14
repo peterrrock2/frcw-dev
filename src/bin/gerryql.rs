@@ -5,7 +5,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::{App, Arg};
+use clap::{value_parser, Arg, Command};
 // use frcw::init::graph_from_networkx;
 use petgraph::graph::{Graph, NodeIndex};
 use serde_json::Value;
@@ -15,28 +15,28 @@ use std::io::{self, BufRead};
 // use std::path::{Path, PathBuf};
 
 fn main() {
-    let cli = App::new("gerryql")
-        .version("0.1.0")
+    let cli = Command::new("gerryql")
+        .version("0.1.3")
         .author("Parker J. Rule <parker.rule@tufts.edu>")
         .about("A query engine for statistics on long Markov chain runs.")
         .arg(
-            Arg::with_name("graph_json")
+            Arg::new("graph_json")
                 .long("graph-json")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 //.required(true)
                 .help("The path of the dual graph (in NetworkX format)."),
         )
         .arg(
-            Arg::with_name("chain_data")
+            Arg::new("chain_data")
                 .long("chain-data")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 //.required(true)
                 .help("The path of the chain run data (in JSONL format)."),
         )
         .arg(
-            Arg::with_name("n_threads")
+            Arg::new("n_threads")
                 .long("n-threads")
-                .takes_value(true)
+                .value_parser(value_parser!(usize))
                 .default_value("1")
                 .help("The number of threads to use."),
         );

@@ -41,10 +41,11 @@ struct ResultPacket {
     /// Self-loop statistics.
     counts: SelfLoopCounts,
     /// ≥0 valid proposals generated within the unit of work.
-    proposals: Vec<(usize, RecomProposal)>,
+    proposals: Vec<(u64, RecomProposal)>,
 }
 
 /// Information necessary to compute statistics about an accepted proposal.
+#[derive(Debug)]
 struct StepPacket {
     /// The current step count of the chain.
     step: u64,
@@ -134,7 +135,10 @@ fn start_job_thread(
     if region_aware {
         st_sampler = Box::new(RegionAwareSampler::new(
             buf_size,
-            params.region_weights.clone().unwrap(),
+            params
+                .region_weights
+                .clone()
+                .expect("Region weights required for region-aware ReCom."),
         ));
         region_aware_attrs = params
             .region_weights
@@ -156,7 +160,7 @@ fn start_job_thread(
             None => {}
         }
         let mut counts = SelfLoopCounts::default();
-        let mut proposals = Vec::<(usize, RecomProposal)>::new();
+        let mut proposals = Vec::<(u64, RecomProposal)>::new();
         for _ in 0..next.n_steps {
             // loop allows retries for non-reversible ReCom
             loop {
@@ -228,20 +232,20 @@ fn start_job_thread(
                                     n_splits, seam_length
                                 );
                             }
-                            if rng.gen::<f64>() < prob {
+                            if rng.random::<f64>() < prob {
                                 // the proposal needs to have a unique identifier so that when the
                                 // packets finish, the selected plan is close to deterministic
-                                // chance of a single batch getting duplicate numbers is near zero 
+                                // chance of a single batch getting duplicate numbers is near zero
                                 // for batches of size < 1M and n_cores < 10k over a 1B run
-                                proposals.push((rng.gen(), proposal_buf.clone()));
+                                proposals.push((rng.random::<u64>(), proposal_buf.clone()));
                             } else {
                                 counts.inc(SelfLoopReason::SeamLength);
                             }
-                            break;  // success
+                            break; // success
                         } else {
                             // Accept.
-                            proposals.push((rng.gen(), proposal_buf.clone()));
-                            break;  // success
+                            proposals.push((rng.random::<u64>(), proposal_buf.clone()));
+                            break; // success
                         }
                     }
                     Err(_) => {
@@ -305,7 +309,7 @@ pub fn multi_chain(
     params: &RecomParams,
     n_threads: usize,
     batch_size: usize,
-) {
+) -> Result<(), String> {
     let mut step = 0;
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![]; // main thread sends work to job threads
@@ -323,7 +327,7 @@ pub fn multi_chain(
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
 
     // Start job and stats threads.
-    scope(|scope| {
+    let scoped_result = scope(|scope| -> Result<(), String> {
         // Start stats thread.
         scope.spawn(move |_| {
             start_stats_thread(graph.clone(), partition.clone(), writer, stats_recv);
@@ -362,7 +366,7 @@ pub fn multi_chain(
         let mut sampled = SelfLoopCounts::default();
         while step <= params.num_steps {
             let mut counts = SelfLoopCounts::default();
-            let mut proposals = Vec::<(usize, RecomProposal)>::new();
+            let mut proposals = Vec::<(u64, RecomProposal)>::new();
             // This is where the proposals are assigned
             for _ in 0..n_threads {
                 let packet: ResultPacket = result_recv.recv().unwrap();
@@ -378,7 +382,7 @@ pub fn multi_chain(
                 let mut total = loops + proposals.len();
                 while total > 0 {
                     step += 1;
-                    let event = rng.gen_range(0..total);
+                    let event = rng.random_range(0..total);
                     if event < loops {
                         // Case: no accepted proposal (don't need to update worker thread state).
                         sampled.inc(counts.index_and_dec(event).unwrap());
@@ -388,7 +392,7 @@ pub fn multi_chain(
                         if proposals.len() == 0 {
                             panic!("FATAL: Unreachable state in sampler (no proposals left).");
                         }
-                        let proposal = &proposals[rng.gen_range(0..proposals.len())];
+                        let proposal = &proposals[rng.random_range(0..proposals.len())];
                         for job in job_sends.iter() {
                             next_batch(job, Some(proposal.1.clone()), batch_size);
                         }
@@ -422,4 +426,13 @@ pub fn multi_chain(
         stop_stats_thread(&stats_send);
     })
     .unwrap();
+        Ok(())
+    });
+
+    match scoped_result {
+        Ok(inner) => inner, // inner: Result<(), String>
+
+        // This only happens if some thread panicked.
+        Err(_panic) => Err("multi_chain panicked in a worker thread".to_string()),
+    }
 }

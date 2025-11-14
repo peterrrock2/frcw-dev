@@ -3,7 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::{value_t, App, Arg};
+use clap::{value_parser, Arg, ArgAction, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::init::from_networkx;
 use frcw::recom::run::multi_chain;
@@ -18,85 +18,87 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 fn main() {
-    let mut cli = App::new("frcw")
-        .version("0.1.0")
+    let mut cli = Command::new("frcw")
+        .version("0.1.3")
         .author("Parker J. Rule <parker.rule@tufts.edu>")
         .about("A minimal implementation of the ReCom Markov chain")
         .arg(
-            Arg::with_name("graph_json")
+            Arg::new("graph_json")
                 .long("graph-json")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The path of the dual graph (in NetworkX format)."),
         )
         .arg(
-            Arg::with_name("n_steps")
+            Arg::new("n_steps")
                 .long("n-steps")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(u64))
                 .help("The number of proposals to generate."),
         )
         .arg(
-            Arg::with_name("target_pop")
+            Arg::new("target_pop")
                 .long("target-pop")
-                .takes_value(true)
+                .value_parser(value_parser!(u64))
                 .help("The target population for the districts."),
         )
         .arg(
-            Arg::with_name("tol")
+            Arg::new("tol")
                 .long("tol")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(f64))
                 .help("The relative population tolerance."),
         )
         .arg(
-            Arg::with_name("pop_col")
+            Arg::new("pop_col")
                 .long("pop-col")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The name of the total population column in the graph metadata."),
         )
         .arg(
-            Arg::with_name("assignment_col")
+            Arg::new("assignment_col")
                 .long("assignment-col")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(String))
                 .help("The name of the assignment column in the graph metadata."),
         )
         .arg(
-            Arg::with_name("rng_seed")
+            Arg::new("rng_seed")
                 .long("rng-seed")
-                .takes_value(true)
                 .required(true)
+                .value_parser(value_parser!(u64))
                 .help("The seed of the RNG used to draw proposals."),
         )
         .arg(
-            Arg::with_name("balance_ub")
+            Arg::new("balance_ub")
                 .long("balance-ub")
-                .short("M") // Variable used in RevReCom paper
-                .takes_value(true)
+                .short('M') // Variable used in RevReCom paper
+                .value_parser(value_parser!(u32))
                 .default_value("0") // TODO: just use unwrap_or_default() instead?
                 .help("The normalizing constant (reversible ReCom only)."),
         )
         .arg(
-            Arg::with_name("n_threads")
+            Arg::new("n_threads")
                 .long("n-threads")
-                .takes_value(true)
-                .required(true)
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("1")
                 .help("The number of threads to use."),
         )
         .arg(
-            Arg::with_name("batch_size")
+            Arg::new("batch_size")
                 .long("batch-size")
-                .takes_value(true)
-                .required(true)
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("1")
                 .help("The number of proposals per batch job."),
         )
         .arg(
-            Arg::with_name("variant")
+            Arg::new("variant")
                 .long("variant")
-                .takes_value(true)
-                .default_value("reversible")
+                .required(true)
+                .value_parser(value_parser!(String))
                 .help(
                     "The ReCom variant to use. The options are\n\
                     \tcut-edges-rmst (ReCom-A)\n\
@@ -109,62 +111,89 @@ fn main() {
                 ),
         ) // other options: cut_edges, district_pairs
         .arg(
-            Arg::with_name("writer")
+            Arg::new("writer")
                 .long("writer")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 .default_value("jsonl")
                 .help(
-                    "The output writer to use.\n\"
-                    \tjsonl (default): JSON Lines with basic summary statistics (no assignment vectors)\n\
-                    \tjsonl-full: JSON Lines with full assignment vecotors and summary statistics\n\
-                    \ttsv: Tab-separated assignement vectors\n\
-                    \tpcompress: Compressed binary format for post-processing with pcompress (old compression format)\n\
+                    "The output writer to use.\n\
+                    \tjsonl (default): JSON Lines with basic summary statistics \n\
+                        \t\t(no assignment vectors)\n\
+                    \tjsonl-full: JSON Lines object with basic summary statistics and a \"nodes\"\n\
+                        \t\tattribute containing node assignments for recombined pairs\n\
+                    \ttsv: Tab-separated assignment vectors\n\
+                    \tpcompress: Compressed binary format for post-processing with pcompress\n\
+                        \t\t(old compression format)\n\
                     \tassignments: TXT output with only assignment vectors\n\
-                    \tcanonicalized-assignments: TXT output with canonicalized (increasing order) assignment vectors\n\
-                    \tcanonical: Standardized JSONL output with assignment vector and sample number\n\
-                    \tben: Compressed binary format for post-processing with BEN (recommended for storing ensembles)."
+                    \tcanonicalized-assignments: TXT output with canonicalized (increasing order)\n\
+                        \t\tassignment vectors\n\
+                    \tcanonical: Standardized JSONL output with assignment vector and sample\n\
+                        \t\tnumber\n\
+                    \tben: Compressed binary format for post-processing with BEN (recommended for \
+                        storing ensembles).",
                 ),
         ) // other options: jsonl-full, tsv
         .arg(
-            Arg::with_name("sum_cols")
+            Arg::new("sum_cols")
                 .long("sum-cols")
-                .multiple(true)
-                .takes_value(true),
+                .value_parser(value_parser!(Option<String>))
+                .num_args(1..)
+                .default_value(None)
+                .help("Additional columns in the graph metadata to sum over districts."),
         )
         .arg(
-            Arg::with_name("region_weights")
+            Arg::new("region_weights")
                 .long("region-weights")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
+                .default_value("")
                 .help(
                     "Region columns with weights for region-aware ReCom. \
                     Must be entered into the command line using the format:\n\
-                    \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'"
+                    \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'",
                 ),
         )
-        .arg(Arg::with_name("cut_edges_count").long("cut-edges-count"))
         .arg(
-            Arg::with_name("output-file")
-                .long("output-file")
-                .short("o")
-                .takes_value(true)
-                .help("The path to write the output to. If not provided, ouput is printed to console."),
-        );
+            Arg::new("cut_edges_count")
+                .long("cut-edges-count")
+                .action(ArgAction::SetTrue)
+                .help("Whether to compute and output the cut edges count at each step."),
+        )
+        .arg(Arg::new("output-file").long("output-file").short('o').help(
+            "The path to write the output to. If not provided, ouput is printed to console.",
+        ));
 
     if cfg!(feature = "linalg") {
-        cli = cli.arg(Arg::with_name("spanning_tree_counts").long("st-counts"));
+        cli = cli.arg(
+            Arg::new("spanning_tree_counts")
+                .long("st-counts")
+                .action(ArgAction::SetTrue)
+                .help("Whether to compute and output the spanning tree counts at each step."),
+        );
     }
+
     let matches = cli.get_matches();
 
-    let n_steps = value_t!(matches.value_of("n_steps"), u64).unwrap_or_else(|e| e.exit());
-    let rng_seed = value_t!(matches.value_of("rng_seed"), u64).unwrap_or_else(|e| e.exit());
-    let target_pop_opt: Option<u64> = value_t!(matches.value_of("target_pop"), u64).ok();
-    let tol = value_t!(matches.value_of("tol"), f64).unwrap_or_else(|e| e.exit());
-    let balance_ub = value_t!(matches.value_of("balance_ub"), u32).unwrap_or_else(|e| e.exit());
-    let n_threads = value_t!(matches.value_of("n_threads"), usize).unwrap_or_else(|e| e.exit());
-    let batch_size = value_t!(matches.value_of("batch_size"), usize).unwrap_or_else(|e| e.exit());
+    let n_steps = *matches
+        .get_one::<u64>("n_steps")
+        .expect("n_steps is required");
+    let rng_seed = *matches
+        .get_one::<u64>("rng_seed")
+        .expect("rng_seed is required");
+    let target_pop_opt: Option<u64> = matches.get_one::<u64>("target_pop").copied();
+    let tol = *matches.get_one::<f64>("tol").expect("tol is required");
+    let balance_ub = *matches
+        .get_one::<u32>("balance_ub")
+        .expect("balance_ub has a default value");
+    let n_threads = *matches
+        .get_one::<usize>("n_threads")
+        .expect("n_threads is required");
+    let batch_size = *matches
+        .get_one::<usize>("batch_size")
+        .expect("batch_size is required");
+
     let graph_path = matches
-        .value_of("graph_json")
-        .expect("There was no value passed to the 'graph-json' is argument.");
+        .get_one::<String>("graph_json")
+        .expect("graph_json is required");
     let graph_path_buf = PathBuf::from(graph_path);
     let graph_json = match fs::canonicalize(&graph_path_buf)
         .map_err(|e| format!("Could not canonicalize path {:?}: {e}", graph_path_buf))
@@ -180,18 +209,36 @@ fn main() {
         Ok(s) => s,
         Err(e) => panic!("{}", e),
     };
-    let pop_col = matches.value_of("pop_col").unwrap();
-    let assignment_col = matches.value_of("assignment_col").unwrap();
-    let variant_str = matches.value_of("variant").unwrap();
-    let writer_str = matches.value_of("writer").unwrap();
-    let st_counts = matches.is_present("spanning_tree_counts");
-    let cut_edges_count = matches.is_present("cut_edges_count");
+
+    let pop_col = matches
+        .get_one::<String>("pop_col")
+        .expect("pop_col is required")
+        .as_str();
+    let assignment_col = matches
+        .get_one::<String>("assignment_col")
+        .expect("assignment_col is required")
+        .as_str();
+    let variant_str = matches
+        .get_one::<String>("variant")
+        .expect("variant has a default value")
+        .as_str();
+    let writer_str = matches
+        .get_one::<String>("writer")
+        .expect("writer has a default value")
+        .as_str();
+
+    let st_counts = if cfg!(feature = "linalg") {
+        matches.get_flag("spanning_tree_counts")
+    } else {
+        false
+    };
+    let cut_edges_count = matches.get_flag("cut_edges_count");
     let mut sum_cols: Vec<String> = matches
-        .values_of("sum_cols")
+        .get_many::<String>("sum_cols")
         .unwrap_or_default()
         .map(|c| c.to_string())
         .collect();
-    let region_weights_raw = matches.value_of("region_weights").unwrap_or_default();
+    let region_weights_raw = (*matches.get_one::<String>("region_weights").unwrap()).as_str();
 
     let variant = match variant_str {
         "reversible" => RecomVariant::Reversible,
@@ -204,7 +251,7 @@ fn main() {
         bad => panic!("Parameter error: invalid variant '{}'", bad),
     };
 
-    let output_buffer: Box<dyn io::Write + Send> = match matches.value_of("output-file") {
+    let output_buffer: Box<dyn io::Write + Send> = match matches.get_one::<String>("output-file") {
         Some(path) => {
             let path = std::path::Path::new(path);
             if path.exists() {
@@ -308,5 +355,9 @@ fn main() {
         // TODO: move this into init
         println!("{}", json!({ "meta": meta }).to_string());
     }
-    multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+    let output = multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+    match output {
+        Ok(_) => {}
+        Err(e) => panic!("Error during chain execution: {}", e),
+    }
 }

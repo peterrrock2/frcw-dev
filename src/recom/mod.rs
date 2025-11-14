@@ -21,7 +21,7 @@ type SpanningTree = Vec<Vec<usize>>;
 /// (There is a generalized version of ReCom that merges and splits
 /// an arbitrary number of districts at a time.) By convention, we
 /// refer to the two districts in a merge/split operation as `a` and `b`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RecomProposal {
     /// The label of the `a`-district in the merge-split proposal.
     pub a_label: usize,
@@ -155,8 +155,8 @@ fn uniform_dist_pair(
     partition: &mut Partition,
     rng: &mut SmallRng,
 ) -> Option<(usize, usize)> {
-    let dist_a = rng.gen_range(0..partition.num_dists) as usize;
-    let dist_b = rng.gen_range(0..partition.num_dists) as usize;
+    let dist_a = rng.random_range(0..partition.num_dists) as usize;
+    let dist_b = rng.random_range(0..partition.num_dists) as usize;
     let num_dists = partition.num_dists;
     let dist_adj = partition.dist_adj(&graph);
     if dist_adj[(dist_a * num_dists as usize) + dist_b] == 0 {
@@ -179,7 +179,7 @@ fn cut_edge_dist_pair(
             partition.assignments
         );
     }
-    let cut_edge_idx = rng.gen_range(0..cut_edges.len()) as usize;
+    let cut_edge_idx = rng.random_range(0..cut_edges.len()) as usize;
     let edge_idx = cut_edges[cut_edge_idx] as usize;
     let dist_a = partition.assignments[graph.edges[edge_idx].0] as usize;
     let dist_b = partition.assignments[graph.edges[edge_idx].1] as usize;
@@ -368,7 +368,7 @@ fn choose_random_cut(
     a: usize,
     b: usize,
 ) -> usize {
-    let balance_node_index = rng.gen_range(0..buf.balance_nodes.len());
+    let balance_node_index = rng.random_range(0..buf.balance_nodes.len());
     generate_cut_from_balance_node(
         subgraph,
         buf,
@@ -415,7 +415,7 @@ fn choose_region_aware_random_cut(
         .filter(|(weight, _)| (weight - max_weight).abs() < 1e-16)
         .map(|(_, idx)| idx)
         .collect();
-    let balance_node_index = candidates[rng.gen_range(0..candidates.len())];
+    let balance_node_index = candidates[rng.random_range(0..candidates.len())];
     generate_cut_from_balance_node(
         subgraph,
         buf,

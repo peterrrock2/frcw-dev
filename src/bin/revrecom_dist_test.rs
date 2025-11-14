@@ -6,7 +6,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::{value_t, App, Arg};
+use clap::{value_parser, Arg, Command};
 use frcw::graph::Graph;
 use frcw::partition::Partition;
 use frcw::recom::run::multi_chain;
@@ -15,88 +15,105 @@ use frcw::stats::{AssignmentsOnlyWriter, StatsWriter};
 use std::fs::read_to_string;
 
 fn main() {
-    let matches = App::new("frcw-revrecom-dist-test")
-        .version("0.1.0")
+    let matches = Command::new("frcw-revrecom-dist-test")
+        .version("0.1.3")
         .author("Parker J. Rule <parker.rule@tufts.edu>")
         .about("RevReCom distribution tests for frcw")
         .arg(
-            Arg::with_name("graph_file")
+            Arg::new("graph_file")
                 .long("graph-file")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 .required(true)
                 .help("The path of the dual graph (in edge list format)."),
         )
         .arg(
-            Arg::with_name("pop_file")
+            Arg::new("pop_file")
                 .long("pop-file")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 .required(true)
                 .help("The path of the population file for the dual graph."),
         )
         .arg(
-            Arg::with_name("assignment_file")
+            Arg::new("assignment_file")
                 .long("assignment-file")
-                .takes_value(true)
+                .value_parser(value_parser!(String))
                 .required(true)
                 .help("The path of the seed plan assignment for the dual graph."),
         )
         .arg(
-            Arg::with_name("n_steps")
+            Arg::new("n_steps")
                 .long("n-steps")
-                .takes_value(true)
+                .value_parser(value_parser!(u64))
                 .required(true)
                 .help("The number of proposals to generate."),
         )
         .arg(
-            Arg::with_name("tol")
+            Arg::new("tol")
                 .long("tol")
-                .takes_value(true)
+                .value_parser(value_parser!(f64))
                 .required(true)
                 .help("The relative population tolerance."),
         )
         .arg(
-            Arg::with_name("rng_seed")
+            Arg::new("rng_seed")
                 .long("rng-seed")
-                .takes_value(true)
+                .value_parser(value_parser!(u64))
                 .required(true)
                 .help("The seed of the RNG used to draw proposals."),
         )
         .arg(
-            Arg::with_name("balance_ub")
+            Arg::new("balance_ub")
                 .long("balance-ub")
-                .short("M") // Variable used in RevReCom paper
-                .takes_value(true)
+                .value_parser(value_parser!(u32))
+                .short('M') // Variable used in RevReCom paper
                 .default_value("0") // TODO: just use unwrap_or_default() instead?
                 .help("The normalizing constant (reversible ReCom only)."),
         )
         .arg(
-            Arg::with_name("n_threads")
+            Arg::new("n_threads")
                 .long("n-threads")
-                .takes_value(true)
+                .value_parser(value_parser!(usize))
                 .required(true)
                 .help("The number of threads to use."),
         )
         .arg(
-            Arg::with_name("batch_size")
+            Arg::new("batch_size")
                 .long("batch-size")
-                .takes_value(true)
+                .value_parser(value_parser!(usize))
                 .required(true)
                 .help("The number of proposals per batch job."),
         )
         .get_matches();
 
-    let n_steps = value_t!(matches.value_of("n_steps"), u64).unwrap_or_else(|e| e.exit());
-    let rng_seed = value_t!(matches.value_of("rng_seed"), u64).unwrap_or_else(|e| e.exit());
-    let tol = value_t!(matches.value_of("tol"), f64).unwrap_or_else(|e| e.exit());
-    let balance_ub = value_t!(matches.value_of("balance_ub"), u32).unwrap_or_else(|e| e.exit());
-    let n_threads = value_t!(matches.value_of("n_threads"), usize).unwrap_or_else(|e| e.exit());
-    let batch_size = value_t!(matches.value_of("batch_size"), usize).unwrap_or_else(|e| e.exit());
-    let graph_path = matches.value_of("graph_file").unwrap();
-    let pop_path = matches.value_of("pop_file").unwrap();
-    let assignments_path = matches.value_of("assignment_file").unwrap();
+    let n_steps = *matches
+        .get_one::<u64>("n_steps")
+        .expect("n_steps is required");
+    let rng_seed = *matches
+        .get_one::<u64>("rng_seed")
+        .expect("rng_seed is required");
+    let tol = *matches.get_one::<f64>("tol").expect("tol is required");
+    let balance_ub = *matches
+        .get_one::<u32>("balance_ub")
+        .expect("balance_ub has a default value");
+    let n_threads = *matches
+        .get_one::<usize>("n_threads")
+        .expect("n_threads is required");
+    let batch_size = *matches
+        .get_one::<usize>("batch_size")
+        .expect("batch_size is required");
+    let pop_path = matches
+        .get_one::<String>("pop_file")
+        .expect("pop_file is required");
+    let assignments_path = matches
+        .get_one::<String>("assignment_file")
+        .expect("assignment_file is required");
+    let graph_path = matches
+        .get_one::<String>("graph_file")
+        .expect("graph_file is required");
 
-    assert!(tol >= 0.0 && tol <= 1.0);
-    assert!(balance_ub > 0);
+    if tol < 0.0 || tol > 1.0 {
+        panic!("Parameter error: '--tol' must be between 0 and 1.");
+    }
 
     let graph_data = read_to_string(graph_path).expect("Could not read edge list file");
     let pop_data = read_to_string(pop_path).expect("Could not read population file");
@@ -118,5 +135,10 @@ fn main() {
 
     let output_buffer = Box::new(std::io::BufWriter::new(std::io::stdout()));
     let writer: Box<dyn StatsWriter> = Box::new(AssignmentsOnlyWriter::new(true, output_buffer));
-    multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+
+    let output = multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+    match output {
+        Ok(_) => {}
+        Err(e) => panic!("Error during chain execution: {}", e),
+    }
 }
