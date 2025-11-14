@@ -37,6 +37,12 @@ fn main() {
                 .help("The number of proposals to generate."),
         )
         .arg(
+            Arg::with_name("target_pop")
+                .long("target-pop")
+                .takes_value(true)
+                .help("The target population for the districts."),
+        )
+        .arg(
             Arg::with_name("tol")
                 .long("tol")
                 .takes_value(true)
@@ -90,13 +96,34 @@ fn main() {
             Arg::with_name("variant")
                 .long("variant")
                 .takes_value(true)
-                .default_value("reversible"),
+                .default_value("reversible")
+                .help(
+                    "The ReCom variant to use. The options are\n\
+                    \tcut-edges-rmst (ReCom-A)\n\
+                    \tdistrict-pairs-rmst (ReCom-B)\n\
+                    \tcut-edges-ust (ReCom-C)\n\
+                    \tdistrict-pairs-ust (ReCom-D)\n\
+                    \tcut-edges-region-aware (Recom-AW)\n\
+                    \tdistrict-pairs-region-aware (Recom-BW)\n\
+                    \treversible (RevReCom)",
+                ),
         ) // other options: cut_edges, district_pairs
         .arg(
             Arg::with_name("writer")
                 .long("writer")
                 .takes_value(true)
-                .default_value("jsonl"),
+                .default_value("jsonl")
+                .help(
+                    "The output writer to use.\n\"
+                    \tjsonl (default): JSON Lines with basic summary statistics (no assignment vectors)\n\
+                    \tjsonl-full: JSON Lines with full assignment vecotors and summary statistics\n\
+                    \ttsv: Tab-separated assignement vectors\n\
+                    \tpcompress: Compressed binary format for post-processing with pcompress (old compression format)\n\
+                    \tassignments: TXT output with only assignment vectors\n\
+                    \tcanonicalized-assignments: TXT output with canonicalized (increasing order) assignment vectors\n\
+                    \tcanonical: Standardized JSONL output with assignment vector and sample number\n\
+                    \tben: Compressed binary format for post-processing with BEN (recommended for storing ensembles)."
+                ),
         ) // other options: jsonl-full, tsv
         .arg(
             Arg::with_name("sum_cols")
@@ -108,7 +135,11 @@ fn main() {
             Arg::with_name("region_weights")
                 .long("region-weights")
                 .takes_value(true)
-                .help("Region columns with weights for region-aware ReCom."),
+                .help(
+                    "Region columns with weights for region-aware ReCom. \
+                    Must be entered into the command line using the format:\n\
+                    \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'"
+                ),
         )
         .arg(Arg::with_name("cut_edges_count").long("cut-edges-count"))
         .arg(
@@ -116,23 +147,39 @@ fn main() {
                 .long("output-file")
                 .short("o")
                 .takes_value(true)
-                .help("The path to write the output to."),
+                .help("The path to write the output to. If not provided, ouput is printed to console."),
         );
+
     if cfg!(feature = "linalg") {
         cli = cli.arg(Arg::with_name("spanning_tree_counts").long("st-counts"));
     }
     let matches = cli.get_matches();
+
     let n_steps = value_t!(matches.value_of("n_steps"), u64).unwrap_or_else(|e| e.exit());
     let rng_seed = value_t!(matches.value_of("rng_seed"), u64).unwrap_or_else(|e| e.exit());
+    let target_pop_opt: Option<u64> = value_t!(matches.value_of("target_pop"), u64).ok();
     let tol = value_t!(matches.value_of("tol"), f64).unwrap_or_else(|e| e.exit());
     let balance_ub = value_t!(matches.value_of("balance_ub"), u32).unwrap_or_else(|e| e.exit());
     let n_threads = value_t!(matches.value_of("n_threads"), usize).unwrap_or_else(|e| e.exit());
     let batch_size = value_t!(matches.value_of("batch_size"), usize).unwrap_or_else(|e| e.exit());
-    let graph_json = fs::canonicalize(PathBuf::from(matches.value_of("graph_json").unwrap()))
-        .unwrap()
+    let graph_path = matches
+        .value_of("graph_json")
+        .expect("There was no value passed to the 'graph-json' is argument.");
+    let graph_path_buf = PathBuf::from(graph_path);
+    let graph_json = match fs::canonicalize(&graph_path_buf)
+        .map_err(|e| format!("Could not canonicalize path {:?}: {e}", graph_path_buf))
+        .expect(format!("Could not create fs buffer from {graph_path}").as_str())
         .into_os_string()
         .into_string()
-        .unwrap();
+        .map_err(|_| {
+            format!(
+                "path for --graph-jaon is not valid UTF-8: {:?}",
+                graph_path_buf
+            )
+        }) {
+        Ok(s) => s,
+        Err(e) => panic!("{}", e),
+    };
     let pop_col = matches.value_of("pop_col").unwrap();
     let assignment_col = matches.value_of("assignment_col").unwrap();
     let variant_str = matches.value_of("variant").unwrap();
@@ -193,7 +240,9 @@ fn main() {
         panic!("For reversible ReCom, specify M > 0.");
     }
 
-    assert!(tol >= 0.0 && tol <= 1.0);
+    if tol < 0.0 || tol > 1.0 {
+        panic!("Parameter error: '--tol' must be between 0 and 1.");
+    }
 
     let region_weights = parse_region_weights_config(region_weights_raw);
     // Add the keys in the region weights to sum_cols if they are not there already
@@ -207,7 +256,11 @@ fn main() {
     }
 
     let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols).unwrap();
-    let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+
+    let target_pop = match target_pop_opt {
+        Some(p) => p as f64,
+        None => (graph.total_pop as f64) / (partition.num_dists as f64),
+    };
 
     let params = RecomParams {
         min_pop: ((1.0 - tol) * avg_pop as f64).floor() as u32,

@@ -107,7 +107,13 @@ pub fn graph_from_networkx(
             }
         }
         let new_pop = match &node[pop_col] {
-            serde_json::Value::Number(num) => num.as_u64().unwrap() as u32,
+            serde_json::Value::Number(num) => num.as_f64().expect(
+                format!(
+                    "When getting population, failed to unwrap the value {} as a f64",
+                    num
+                )
+                .as_str(),
+            ) as u32,
             serde_json::Value::String(ref s) => s.parse::<u32>().unwrap(),
             _ => panic!(
                 "{}{}{}",
