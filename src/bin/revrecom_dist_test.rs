@@ -136,7 +136,9 @@ fn main() {
     let output_buffer = Box::new(std::io::BufWriter::new(std::io::stdout()));
     let writer: Box<dyn StatsWriter> = Box::new(AssignmentsOnlyWriter::new(true, output_buffer));
 
-    let output = multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+    let output = multi_chain(
+        &graph, &partition, writer, &params, n_threads, batch_size, false,
+    );
     match output {
         Ok(_) => {}
         Err(e) => panic!("Error during chain execution: {}", e),

@@ -18,12 +18,13 @@ use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler,
 use crate::stats::{SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 /// Determines how many proposals the stats thread can lag behind by
 /// (compared to the head of the chain).
-const STATS_CHANNEL_CAPACITY: usize = 16;
+const STATS_CHANNEL_CAPACITY: usize = 8;
 
 /// A unit of multithreaded work.
 struct JobPacket {
@@ -309,16 +310,19 @@ pub fn multi_chain(
     params: &RecomParams,
     n_threads: usize,
     batch_size: usize,
+    show_progress: bool,
 ) -> Result<(), String> {
     let mut step = 1; // Since people expect the number of outputs to equal n_steps
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![]; // main thread sends work to job threads
     let mut job_recvs = vec![]; // job threads receive work from main thread
+                                //
     for _ in 0..n_threads {
         let (s, r): (Sender<JobPacket>, Receiver<JobPacket>) = unbounded();
         job_sends.push(s);
         job_recvs.push(r);
     }
+
     // All job threads send a summary of chain results back to the main thread.
     let (result_send, result_recv): (Sender<ResultPacket>, Receiver<ResultPacket>) = unbounded();
     // The stats thread receives accepted proposals from the main thread.
@@ -326,8 +330,33 @@ pub fn multi_chain(
         bounded(STATS_CHANNEL_CAPACITY);
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
 
+    // --- Progress bar setup ---
+    let pb = if show_progress {
+        let pb = ProgressBar::with_draw_target(
+            Some(params.num_steps),
+            indicatif::ProgressDrawTarget::stdout_with_hz(1),
+        );
+        pb.set_style(
+            ProgressStyle::with_template(
+                // {bar} with no width spec => indicatif auto-sizes to terminal width
+                "[{elapsed_precise}] {bar:100.cyan/blue} {pos:>10}/{len} ({eta_precise})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+    let mut progress_count: u64 = 0;
+    let mut last_drawn: u64 = 0;
+    let progress_chunk: u64 = (params.num_steps / 1000 as u64 + 1).min(1000);
+
     // Start job and stats threads.
     let scoped_result = scope(|scope| -> Result<(), String> {
+        // Borrow the progress bar inside the scope.
+        let pb_ref = &pb;
+
         // Start stats thread.
         scope.spawn(move |_| {
             start_stats_thread(graph.clone(), partition.clone(), writer, stats_recv);
@@ -383,6 +412,15 @@ pub fn multi_chain(
                 let mut total = loops + proposals.len();
                 while total > 0 && step < params.num_steps {
                     step += 1;
+
+                    if let Some(pb) = pb_ref {
+                        progress_count += 1;
+                        if progress_count - last_drawn >= progress_chunk {
+                            pb.set_position(progress_count);
+                            last_drawn = progress_count;
+                        }
+                    }
+
                     let event = rng.random_range(0..total);
                     if event < loops {
                         // Case: no accepted proposal (don't need to update worker thread state).
@@ -415,16 +453,28 @@ pub fn multi_chain(
             } else {
                 sampled = sampled + counts;
                 step += loops as u64;
-                if step >= params.num_steps as u64 && previously_accepted_proposal.is_some() {
+
+                if let Some(pb) = pb_ref {
+                    let remaining = params.num_steps - progress_count;
+                    let inc = remaining.min(loops as u64);
+                    progress_count += inc;
+                    if progress_count - last_drawn >= progress_chunk {
+                        pb.set_position(progress_count);
+                        last_drawn = progress_count;
+                    }
+                }
+
+                if step >= params.num_steps && previously_accepted_proposal.is_some() {
                     stats_send
                         .send(StepPacket {
-                            step: step,
+                            step,
                             proposal: previously_accepted_proposal.clone(),
                             counts: sampled.clone(),
                             terminate: true,
                         })
                         .unwrap();
                 }
+
                 for job in job_sends.iter() {
                     next_batch(job, None, batch_size);
                 }
@@ -445,6 +495,11 @@ pub fn multi_chain(
         }
         Ok(())
     });
+
+    if let Some(pb) = pb {
+        pb.set_position(params.num_steps);
+        pb.finish_and_clear();
+    }
 
     match scoped_result {
         Ok(inner) => inner, // inner: Result<(), String>

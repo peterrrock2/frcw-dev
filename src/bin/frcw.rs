@@ -18,89 +18,90 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 fn main() {
-    let mut cli = Command::new("frcw")
-        .version("0.1.3")
-        .author("Parker J. Rule <parker.rule@tufts.edu>")
-        .about("A minimal implementation of the ReCom Markov chain")
-        .arg(
-            Arg::new("graph_json")
-                .long("graph-json")
-                .required(true)
-                .value_parser(value_parser!(String))
-                .help("The path of the dual graph (in NetworkX format)."),
-        )
-        .arg(
-            Arg::new("n_steps")
-                .long("n-steps")
-                .required(true)
-                .value_parser(value_parser!(u64))
-                .help("The number of proposals to generate."),
-        )
-        .arg(
-            Arg::new("target_pop")
-                .long("target-pop")
-                .value_parser(value_parser!(u64))
-                .help("The target population for the districts."),
-        )
-        .arg(
-            Arg::new("tol")
-                .long("tol")
-                .required(true)
-                .value_parser(value_parser!(f64))
-                .help("The relative population tolerance."),
-        )
-        .arg(
-            Arg::new("pop_col")
-                .long("pop-col")
-                .required(true)
-                .value_parser(value_parser!(String))
-                .help("The name of the total population column in the graph metadata."),
-        )
-        .arg(
-            Arg::new("assignment_col")
-                .long("assignment-col")
-                .required(true)
-                .value_parser(value_parser!(String))
-                .help("The name of the assignment column in the graph metadata."),
-        )
-        .arg(
-            Arg::new("rng_seed")
-                .long("rng-seed")
-                .required(true)
-                .value_parser(value_parser!(u64))
-                .help("The seed of the RNG used to draw proposals."),
-        )
-        .arg(
-            Arg::new("balance_ub")
-                .long("balance-ub")
-                .short('M') // Variable used in RevReCom paper
-                .value_parser(value_parser!(u32))
-                .default_value("0") // TODO: just use unwrap_or_default() instead?
-                .help("The normalizing constant (reversible ReCom only)."),
-        )
-        .arg(
-            Arg::new("n_threads")
-                .long("n-threads")
-                .required(false)
-                .value_parser(value_parser!(usize))
-                .default_value("1")
-                .help("The number of threads to use."),
-        )
-        .arg(
-            Arg::new("batch_size")
-                .long("batch-size")
-                .required(false)
-                .value_parser(value_parser!(usize))
-                .default_value("1")
-                .help("The number of proposals per batch job."),
-        )
-        .arg(
-            Arg::new("variant")
-                .long("variant")
-                .required(true)
-                .value_parser(value_parser!(String))
-                .help(
-                    "The ReCom variant to use. The options are\n\
+    let mut cli =
+        Command::new("frcw")
+            .version("0.1.3")
+            .author("Parker J. Rule <parker.rule@tufts.edu>")
+            .about("A minimal implementation of the ReCom Markov chain")
+            .arg(
+                Arg::new("graph_json")
+                    .long("graph-json")
+                    .required(true)
+                    .value_parser(value_parser!(String))
+                    .help("The path of the dual graph (in NetworkX format)."),
+            )
+            .arg(
+                Arg::new("n_steps")
+                    .long("n-steps")
+                    .required(true)
+                    .value_parser(value_parser!(u64))
+                    .help("The number of proposals to generate."),
+            )
+            .arg(
+                Arg::new("target_pop")
+                    .long("target-pop")
+                    .value_parser(value_parser!(u64))
+                    .help("The target population for the districts."),
+            )
+            .arg(
+                Arg::new("tol")
+                    .long("tol")
+                    .required(true)
+                    .value_parser(value_parser!(f64))
+                    .help("The relative population tolerance."),
+            )
+            .arg(
+                Arg::new("pop_col")
+                    .long("pop-col")
+                    .required(true)
+                    .value_parser(value_parser!(String))
+                    .help("The name of the total population column in the graph metadata."),
+            )
+            .arg(
+                Arg::new("assignment_col")
+                    .long("assignment-col")
+                    .required(true)
+                    .value_parser(value_parser!(String))
+                    .help("The name of the assignment column in the graph metadata."),
+            )
+            .arg(
+                Arg::new("rng_seed")
+                    .long("rng-seed")
+                    .required(true)
+                    .value_parser(value_parser!(u64))
+                    .help("The seed of the RNG used to draw proposals."),
+            )
+            .arg(
+                Arg::new("balance_ub")
+                    .long("balance-ub")
+                    .short('M') // Variable used in RevReCom paper
+                    .value_parser(value_parser!(u32))
+                    .default_value("0") // TODO: just use unwrap_or_default() instead?
+                    .help("The normalizing constant (reversible ReCom only)."),
+            )
+            .arg(
+                Arg::new("n_threads")
+                    .long("n-threads")
+                    .required(false)
+                    .value_parser(value_parser!(usize))
+                    .default_value("1")
+                    .help("The number of threads to use."),
+            )
+            .arg(
+                Arg::new("batch_size")
+                    .long("batch-size")
+                    .required(false)
+                    .value_parser(value_parser!(usize))
+                    .default_value("1")
+                    .help("The number of proposals per batch job."),
+            )
+            .arg(
+                Arg::new("variant")
+                    .long("variant")
+                    .required(true)
+                    .value_parser(value_parser!(String))
+                    .help(
+                        "The ReCom variant to use. The options are\n\
                     \tcut-edges-rmst (ReCom-A)\n\
                     \tdistrict-pairs-rmst (ReCom-B)\n\
                     \tcut-edges-ust (ReCom-C)\n\
@@ -108,15 +109,15 @@ fn main() {
                     \tcut-edges-region-aware (Recom-AW)\n\
                     \tdistrict-pairs-region-aware (Recom-BW)\n\
                     \treversible (RevReCom)",
-                ),
-        ) // other options: cut_edges, district_pairs
-        .arg(
-            Arg::new("writer")
-                .long("writer")
-                .value_parser(value_parser!(String))
-                .default_value("jsonl")
-                .help(
-                    "The output writer to use.\n\
+                    ),
+            ) // other options: cut_edges, district_pairs
+            .arg(
+                Arg::new("writer")
+                    .long("writer")
+                    .value_parser(value_parser!(String))
+                    .default_value("jsonl")
+                    .help(
+                        "The output writer to use.\n\
                     \tjsonl (default): JSON Lines with basic summary statistics \n\
                         \t\t(no assignment vectors)\n\
                     \tjsonl-full: JSON Lines object with basic summary statistics and a \"nodes\"\n\
@@ -131,36 +132,42 @@ fn main() {
                         \t\tnumber\n\
                     \tben: Compressed binary format for post-processing with BEN (recommended for \
                         storing ensembles).",
-                ),
-        ) // other options: jsonl-full, tsv
-        .arg(
-            Arg::new("sum_cols")
-                .long("sum-cols")
-                .value_parser(value_parser!(Option<String>))
-                .num_args(1..)
-                .default_value(None)
-                .help("Additional columns in the graph metadata to sum over districts."),
-        )
-        .arg(
-            Arg::new("region_weights")
-                .long("region-weights")
-                .value_parser(value_parser!(String))
-                .default_value("")
-                .help(
-                    "Region columns with weights for region-aware ReCom. \
+                    ),
+            ) // other options: jsonl-full, tsv
+            .arg(
+                Arg::new("sum_cols")
+                    .long("sum-cols")
+                    .value_parser(value_parser!(Option<String>))
+                    .num_args(1..)
+                    .default_value(None)
+                    .help("Additional columns in the graph metadata to sum over districts."),
+            )
+            .arg(
+                Arg::new("region_weights")
+                    .long("region-weights")
+                    .value_parser(value_parser!(String))
+                    .default_value("")
+                    .help(
+                        "Region columns with weights for region-aware ReCom. \
                     Must be entered into the command line using the format:\n\
                     \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'",
-                ),
-        )
-        .arg(
-            Arg::new("cut_edges_count")
-                .long("cut-edges-count")
-                .action(ArgAction::SetTrue)
-                .help("Whether to compute and output the cut edges count at each step."),
-        )
-        .arg(Arg::new("output-file").long("output-file").short('o').help(
-            "The path to write the output to. If not provided, ouput is printed to console.",
-        ));
+                    ),
+            )
+            .arg(
+                Arg::new("cut_edges_count")
+                    .long("cut-edges-count")
+                    .action(ArgAction::SetTrue)
+                    .help("Whether to compute and output the cut edges count at each step."),
+            )
+            .arg(Arg::new("output-file").long("output-file").short('o').help(
+                "The path to write the output to. If not provided, ouput is printed to console.",
+            ))
+            .arg(
+                Arg::new("show-progress")
+                    .long("show-progress")
+                    .action(ArgAction::SetTrue)
+                    .help("Whether to show a progress bar during execution."),
+            );
 
     if cfg!(feature = "linalg") {
         cli = cli.arg(
@@ -355,7 +362,18 @@ fn main() {
         // TODO: move this into init
         println!("{}", json!({ "meta": meta }).to_string());
     }
-    let output = multi_chain(&graph, &partition, writer, &params, n_threads, batch_size);
+
+    let show_progress = matches.get_flag("show-progress");
+
+    let output = multi_chain(
+        &graph,
+        &partition,
+        writer,
+        &params,
+        n_threads,
+        batch_size,
+        show_progress,
+    );
     match output {
         Ok(_) => {}
         Err(e) => panic!("Error during chain execution: {}", e),

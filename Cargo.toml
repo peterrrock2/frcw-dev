@@ -21,6 +21,7 @@ sha3 = "0.10.0"
 snafu = "0.8.9"
 itertools = "0.14.0"
 binary-ensemble = "0.3.0"
+indicatif = "0.18.3"
 
 [dev-dependencies]
 rstest = "0.10.0"
