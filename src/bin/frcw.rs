@@ -309,7 +309,13 @@ fn main() {
         }
     }
 
-    let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols).unwrap();
+    let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols)
+        .unwrap_or_else(|e| {
+            panic!(
+                "Could not load graph and partition from {}: {}",
+                graph_json, e
+            )
+        });
 
     let target_pop = match target_pop_opt {
         Some(p) => p as f64,

@@ -30,13 +30,25 @@ pub fn from_networkx(
         Err(e) => return Err(e),
     };
 
-    let raw_nodes = data["nodes"].as_array().unwrap();
+    let raw_nodes = data["nodes"].as_array().expect("Could not get nodes array");
     let assignments: Vec<u32> = raw_nodes
         .iter()
         .enumerate()
         .map(|(i, node)| match &node[assignment_col] {
-            serde_json::Value::Number(num) => num.as_u64().unwrap() as u32,
-            serde_json::Value::String(ref s) => s.parse::<u32>().unwrap(),
+            serde_json::Value::Number(num) => num.as_u64().expect(
+                format!(
+                    "When geting assignment, failed to unwrap the value {} as a u32",
+                    num
+                )
+                .as_str(),
+            ) as u32,
+            serde_json::Value::String(ref s) => s.parse::<u32>().expect(
+                format!(
+                    "When getting assignment, failed to unwrap the value {} as a u32",
+                    s
+                )
+                .as_str(),
+            ),
             _ => panic!(
                 "{}{}{}",
                 "Unexpected entry type in assignment column. ",
@@ -48,7 +60,8 @@ pub fn from_networkx(
             ),
         })
         .collect();
-    let partition = Partition::from_assignments(&graph, &assignments).unwrap();
+    let partition =
+        Partition::from_assignments(&graph, &assignments).expect("Could not create partition");
     return Ok((graph, partition));
 }
 
