@@ -3,8 +3,43 @@ use crate::graph::{Edge, Graph};
 use crate::partition::Partition;
 use serde_json::Result as SerdeResult;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
+
+/// Returns `(district_label, components, node_count)` for each disconnected district.
+fn disconnected_districts(graph: &Graph, partition: &Partition) -> Vec<(usize, usize, usize)> {
+    let mut disconnected = Vec::<(usize, usize, usize)>::new();
+    for (dist_idx, nodes) in partition.dist_nodes.iter().enumerate() {
+        if nodes.len() <= 1 {
+            continue;
+        }
+        let node_set = nodes.iter().copied().collect::<HashSet<usize>>();
+        let mut visited = HashSet::<usize>::with_capacity(nodes.len());
+        let mut stack = Vec::<usize>::with_capacity(nodes.len());
+        let mut components = 0;
+        for &start in nodes.iter() {
+            if visited.contains(&start) {
+                continue;
+            }
+            components += 1;
+            visited.insert(start);
+            stack.push(start);
+            while let Some(node) = stack.pop() {
+                for &neighbor in graph.neighbors[node].iter() {
+                    if node_set.contains(&neighbor) && !visited.contains(&neighbor) {
+                        visited.insert(neighbor);
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+        if components > 1 {
+            disconnected.push((dist_idx + 1, components, nodes.len()));
+        }
+    }
+    disconnected
+}
 
 /// Loads graph and partition data in the NetworkX `adjacency_data` format
 /// used by [GerryChain](https://github.com/mggg/gerrychain). Returns a
@@ -60,8 +95,47 @@ pub fn from_networkx(
             ),
         })
         .collect();
-    let partition =
-        Partition::from_assignments(&graph, &assignments).expect("Could not create partition");
+    let partition = Partition::from_assignments(&graph, &assignments).map_err(|e| {
+        serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Could not create partition from assignment column '{}': {}",
+                assignment_col, e
+            ),
+        ))
+    })?;
+
+    let disconnected = disconnected_districts(&graph, &partition);
+    if !disconnected.is_empty() {
+        let max_items = 8;
+        let preview = disconnected
+            .iter()
+            .take(max_items)
+            .map(|(label, components, node_count)| {
+                format!(
+                    "district {} ({} components, {} nodes)",
+                    label, components, node_count
+                )
+            })
+            .collect::<Vec<String>>()
+            .join(", ");
+        let more = if disconnected.len() > max_items {
+            format!(", and {} more", disconnected.len() - max_items)
+        } else {
+            "".to_string()
+        };
+        return Err(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Assignment column '{}' is disconnected in {} district(s): {}{}.",
+                assignment_col,
+                disconnected.len(),
+                preview,
+                more
+            ),
+        )));
+    }
+
     return Ok((graph, partition));
 }
 
@@ -88,6 +162,18 @@ pub fn graph_from_networkx(
     let raw_nodes = data["nodes"].as_array().unwrap();
     let raw_adj = data["adjacency"].as_array().unwrap();
     let num_nodes = raw_nodes.len();
+    let mut node_id_to_index = HashMap::<String, usize>::with_capacity(num_nodes);
+    for (index, node) in raw_nodes.iter().enumerate() {
+        let id = node
+            .as_object()
+            .and_then(|obj| obj.get("id"))
+            .unwrap_or_else(|| panic!("Node {} is missing an 'id' field.", index));
+        let key = serde_json::to_string(id).expect("Could not serialize node id.");
+        if node_id_to_index.insert(key.clone(), index).is_some() {
+            panic!("Duplicate node id in graph JSON: {}", key);
+        }
+    }
+
     let mut pops = Vec::<u32>::with_capacity(num_nodes);
     let mut neighbors = Vec::<Vec<usize>>::with_capacity(num_nodes);
     let mut edges = Vec::<Edge>::new();
@@ -103,7 +189,22 @@ pub fn graph_from_networkx(
             .as_array()
             .unwrap()
             .into_iter()
-            .map(|n| n.as_object().unwrap()["id"].as_u64().unwrap() as usize)
+            .map(|n| {
+                let neighbor_id =
+                    n.as_object()
+                        .and_then(|obj| obj.get("id"))
+                        .unwrap_or_else(|| {
+                            panic!("Node {} has an adjacency entry without an 'id'.", index)
+                        });
+                let neighbor_key =
+                    serde_json::to_string(neighbor_id).expect("Could not serialize neighbor id.");
+                *node_id_to_index.get(&neighbor_key).unwrap_or_else(|| {
+                    panic!(
+                        "Node {} has adjacency to unknown node id {}.",
+                        index, neighbor_key
+                    )
+                })
+            })
             .collect();
         for col in columns.iter() {
             if let Some(data) = attr.get_mut(col) {
@@ -159,4 +260,138 @@ pub fn graph_from_networkx(
         attr: attr,
     };
     return Ok((graph, data));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_graph(data: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("frcw_init_test_{}_{}.json", std::process::id(), ts));
+        fs::write(&path, data).unwrap();
+        path
+    }
+
+    fn connected_component_count(graph: &Graph) -> usize {
+        let mut visited = vec![false; graph.neighbors.len()];
+        let mut count = 0;
+        for start in 0..graph.neighbors.len() {
+            if visited[start] {
+                continue;
+            }
+            count += 1;
+            let mut stack = vec![start];
+            visited[start] = true;
+            while let Some(node) = stack.pop() {
+                for &neighbor in graph.neighbors[node].iter() {
+                    if !visited[neighbor] {
+                        visited[neighbor] = true;
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn graph_from_networkx_one_indexed_ids() {
+        let json = serde_json::json!({
+            "directed": false,
+            "multigraph": false,
+            "graph": [],
+            "nodes": [
+                {"id": 1, "population": 1},
+                {"id": 2, "population": 1},
+                {"id": 3, "population": 1},
+                {"id": 4, "population": 1}
+            ],
+            "adjacency": [
+                [{"id": 2}],
+                [{"id": 1}, {"id": 3}],
+                [{"id": 2}, {"id": 4}],
+                [{"id": 3}]
+            ]
+        });
+        let path = write_temp_graph(&json.to_string());
+        let path_str = path.to_string_lossy();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![]).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            graph.neighbors,
+            vec![vec![1], vec![0, 2], vec![1, 3], vec![2]]
+        );
+        assert_eq!(graph.edges, vec![Edge(0, 1), Edge(1, 2), Edge(2, 3)]);
+        assert_eq!(connected_component_count(&graph), 1);
+    }
+
+    #[test]
+    fn graph_from_networkx_shuffled_node_ids() {
+        let json = serde_json::json!({
+            "directed": false,
+            "multigraph": false,
+            "graph": [],
+            "nodes": [
+                {"id": 10, "population": 1},
+                {"id": 30, "population": 1},
+                {"id": 20, "population": 1},
+                {"id": 40, "population": 1}
+            ],
+            "adjacency": [
+                [{"id": 20}],
+                [{"id": 20}, {"id": 40}],
+                [{"id": 10}, {"id": 30}],
+                [{"id": 30}]
+            ]
+        });
+        let path = write_temp_graph(&json.to_string());
+        let path_str = path.to_string_lossy();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![]).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            graph.neighbors,
+            vec![vec![2], vec![2, 3], vec![0, 1], vec![1]]
+        );
+        assert_eq!(graph.edges, vec![Edge(0, 2), Edge(1, 2), Edge(1, 3)]);
+        assert_eq!(connected_component_count(&graph), 1);
+    }
+
+    #[test]
+    fn from_networkx_rejects_disconnected_seed_partition() {
+        let json = serde_json::json!({
+            "directed": false,
+            "multigraph": false,
+            "graph": [],
+            "nodes": [
+                {"id": 0, "population": 1, "district": 1},
+                {"id": 1, "population": 1, "district": 2},
+                {"id": 2, "population": 1, "district": 1},
+                {"id": 3, "population": 1, "district": 2}
+            ],
+            "adjacency": [
+                [{"id": 1}],
+                [{"id": 0}, {"id": 2}],
+                [{"id": 1}, {"id": 3}],
+                [{"id": 2}]
+            ]
+        });
+        let path = write_temp_graph(&json.to_string());
+        let path_str = path.to_string_lossy();
+        let err = from_networkx(&path_str, "population", "district", vec![]).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("disconnected"));
+        assert!(msg.contains("Assignment column 'district'"));
+        assert!(msg.contains("district 1"));
+    }
 }

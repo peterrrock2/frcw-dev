@@ -302,7 +302,7 @@ fn balanced_cuts(
     }
 
     // Find ε-balanced cuts.
-    for (index, &pop) in buf.tree_pops.iter().enumerate() {
+    for (index, &pop) in buf.tree_pops.iter().take(subgraph.pops.len()).enumerate() {
         if pop >= params.min_pop
             && pop <= params.max_pop
             && subgraph.total_pop - pop >= params.min_pop

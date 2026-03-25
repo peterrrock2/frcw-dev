@@ -19,6 +19,29 @@ use serde_json::json;
 use std::collections::HashMap;
 pub type ScoreValue = f64;
 
+/// Returns true iff `graph` has exactly one connected component.
+fn graph_connected(graph: &Graph) -> bool {
+    let n = graph.pops.len();
+    if n <= 1 {
+        return true;
+    }
+    let mut visited = vec![false; n];
+    let mut stack = Vec::<usize>::with_capacity(n);
+    visited[0] = true;
+    stack.push(0);
+    let mut seen = 1;
+    while let Some(node) = stack.pop() {
+        for &neighbor in graph.neighbors[node].iter() {
+            if !visited[neighbor] {
+                visited[neighbor] = true;
+                seen += 1;
+                stack.push(neighbor);
+            }
+        }
+    }
+    seen == n
+}
+
 /// A unit of multithreaded work.
 struct OptJobPacket {
     /// The number of steps to sample (*not* the number of unique plans).
@@ -104,6 +127,9 @@ fn start_opt_thread(
             }
             let (dist_a, dist_b) = dist_pair.unwrap();
             partition.subgraph_with_attr(&graph, &mut subgraph_buf, dist_a, dist_b);
+            if !graph_connected(&subgraph_buf.graph) {
+                continue;
+            }
             st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
             let split = random_split(
                 &subgraph_buf.graph,

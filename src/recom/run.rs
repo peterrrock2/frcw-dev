@@ -26,6 +26,29 @@ use rand::{Rng, SeedableRng};
 /// (compared to the head of the chain).
 const STATS_CHANNEL_CAPACITY: usize = 8;
 
+/// Returns true iff `graph` has exactly one connected component.
+fn graph_connected(graph: &Graph) -> bool {
+    let n = graph.pops.len();
+    if n <= 1 {
+        return true;
+    }
+    let mut visited = vec![false; n];
+    let mut stack = Vec::<usize>::with_capacity(n);
+    visited[0] = true;
+    stack.push(0);
+    let mut seen = 1;
+    while let Some(node) = stack.pop() {
+        for &neighbor in graph.neighbors[node].iter() {
+            if !visited[neighbor] {
+                visited[neighbor] = true;
+                seen += 1;
+                stack.push(neighbor);
+            }
+        }
+    }
+    seen == n
+}
+
 /// A unit of multithreaded work.
 struct JobPacket {
     /// The number of steps to sample (*not* the number of unique plans).
@@ -202,6 +225,17 @@ fn start_job_thread(
                     );
                 } else {
                     partition.subgraph(&graph, &mut subgraph_buf, dist_a, dist_b);
+                }
+
+                // A disconnected merged district pair has no spanning tree.
+                // Treat this as a rejection instead of panicking in the sampler.
+                if !graph_connected(&subgraph_buf.graph) {
+                    if reversible {
+                        counts.inc(SelfLoopReason::NoSplit);
+                        break; // success
+                    } else {
+                        continue; // retry
+                    }
                 }
 
                 // Step 2: draw a random spanning tree of the subgraph induced by the
