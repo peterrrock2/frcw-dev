@@ -346,7 +346,7 @@ pub fn multi_chain(
     batch_size: usize,
     show_progress: bool,
 ) -> Result<(), String> {
-    let mut step = 1; // Since people expect the number of outputs to equal n_steps
+    let mut step = 0;
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![]; // main thread sends work to job threads
     let mut job_recvs = vec![]; // job threads receive work from main thread
@@ -496,17 +496,6 @@ pub fn multi_chain(
                         pb.set_position(progress_count);
                         last_drawn = progress_count;
                     }
-                }
-
-                if step >= params.num_steps && previously_accepted_proposal.is_some() {
-                    stats_send
-                        .send(StepPacket {
-                            step,
-                            proposal: previously_accepted_proposal.clone(),
-                            counts: sampled.clone(),
-                            terminate: true,
-                        })
-                        .unwrap();
                 }
 
                 for job in job_sends.iter() {

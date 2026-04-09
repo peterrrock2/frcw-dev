@@ -309,7 +309,7 @@ fn main() {
         }
     }
 
-    let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols)
+    let (graph, partition) = from_networkx(&graph_json, pop_col, assignment_col, sum_cols, vec![])
         .unwrap_or_else(|e| {
             panic!(
                 "Could not load graph and partition from {}: {}",
