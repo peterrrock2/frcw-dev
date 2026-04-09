@@ -24,7 +24,7 @@ binary-ensemble = "0.3.0"
 indicatif = "0.18.3"
 
 [dev-dependencies]
-rstest = "0.10.0"
+rstest = "0.26.1"
 criterion = "0.3"
 approx = "0.5.0"
 test_fixtures = { path = "test_fixtures" }
@@ -33,6 +33,10 @@ test_fixtures = { path = "test_fixtures" }
 # Enables spanning tree statistics (and eventually other features
 # that depend on a working BLAS installation).
 linalg = ["ndarray", "ndarray-linalg"]
+
+[[bin]]
+name = "frcw_tilted"
+path = "src/bin/frcw_tilted.rs"
 
 [[bench]]
 name = "recom"

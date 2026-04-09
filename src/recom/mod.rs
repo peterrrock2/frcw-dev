@@ -11,6 +11,8 @@ pub mod opt;
 //mod autotune;
 /// ReCom runners.
 pub mod run;
+/// Tilted run optimization.
+pub mod tilted;
 
 /// A lightweight list-of-lists representation of a spanning tree.
 type SpanningTree = Vec<Vec<usize>>;

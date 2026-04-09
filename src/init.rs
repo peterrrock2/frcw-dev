@@ -53,14 +53,17 @@ fn disconnected_districts(graph: &Graph, partition: &Partition) -> Vec<(usize, u
 ///    population. This column should be integer-valued.
 /// * `assignment_col` - A column in the graph JSON corresponding to a
 ///    a seed partition. This column should be integer-valued and 1-indexed.
-/// * `columns` - The metadata columns to sum over (per district).
+/// * `columns` - The node metadata columns to load.
+/// * `edge_float_cols` - Edge attribute columns to load as `f64` (e.g. `"shared_perim"`).
+///    Pass an empty `Vec` if no edge attributes are needed.
 pub fn from_networkx(
     path: &str,
     pop_col: &str,
     assignment_col: &str,
     columns: Vec<String>,
+    edge_float_cols: Vec<String>,
 ) -> SerdeResult<(Graph, Partition)> {
-    let (graph, data) = match graph_from_networkx(path, pop_col, columns) {
+    let (graph, data) = match graph_from_networkx(path, pop_col, columns, edge_float_cols) {
         Ok(v) => v,
         Err(e) => return Err(e),
     };
@@ -149,11 +152,14 @@ pub fn from_networkx(
 /// * `path` - the path of the graph JSON file.
 /// * `pop_col` - The column in the graph JSON corresponding to total node
 ///    population. This column should be integer-valued.
-/// * `columns` - The metadata columns to sum over (per district).
+/// * `columns` - The node metadata columns to load.
+/// * `edge_float_cols` - Edge attribute columns to load as `f64` (e.g. `"shared_perim"`).
+///    Pass an empty `Vec` if no edge attributes are needed.
 pub fn graph_from_networkx(
     path: &str,
     pop_col: &str,
     columns: Vec<String>,
+    edge_float_cols: Vec<String>,
 ) -> SerdeResult<(Graph, Value)> {
     // TODO: should load from a generic buffer.
     let raw = fs::read_to_string(path).expect("Could not load graph");
@@ -250,6 +256,34 @@ pub fn graph_from_networkx(
         }
     }
 
+    // Load float-valued edge attributes (e.g. shared_perim).
+    // For each edge Edge(u, v) (u < v), find the adjacency entry in raw_adj[u]
+    // that points to v and extract the requested float columns.
+    let mut edge_attr: HashMap<String, Vec<f64>> = HashMap::new();
+    if !edge_float_cols.is_empty() {
+        for col in edge_float_cols.iter() {
+            let col_vals: Vec<f64> = edges
+                .iter()
+                .map(|Edge(u, v)| {
+                    raw_adj[*u]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|entry| {
+                            let nid = serde_json::to_string(
+                                entry.as_object().unwrap().get("id").unwrap(),
+                            )
+                            .unwrap();
+                            node_id_to_index.get(&nid).copied() == Some(*v)
+                        })
+                        .and_then(|entry| entry[col.as_str()].as_f64())
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            edge_attr.insert(col.clone(), col_vals);
+        }
+    }
+
     let total_pop = pops.iter().sum();
     let graph = Graph {
         pops: pops,
@@ -258,6 +292,7 @@ pub fn graph_from_networkx(
         edges_start: edges_start.clone(),
         total_pop: total_pop,
         attr: attr,
+        edge_attr: edge_attr,
     };
     return Ok((graph, data));
 }
@@ -322,7 +357,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![]).unwrap();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -354,7 +389,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![]).unwrap();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -386,7 +421,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let err = from_networkx(&path_str, "population", "district", vec![]).unwrap_err();
+        let err = from_networkx(&path_str, "population", "district", vec![], vec![]).unwrap_err();
         fs::remove_file(path).unwrap();
 
         let msg = err.to_string();

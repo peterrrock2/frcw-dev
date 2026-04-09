@@ -48,6 +48,10 @@ pub struct Graph {
     pub total_pop: u32,
     /// Additional node attributes (optional).
     pub attr: HashMap<String, Vec<String>>,
+    /// Float-valued edge attributes (e.g. shared perimeter lengths).
+    /// Indexed parallel to `edges` (i.e. `edge_attr["col"][i]` is the
+    /// value for `edges[i]`).
+    pub edge_attr: HashMap<String, Vec<f64>>,
 }
 
 impl Graph {
@@ -61,6 +65,7 @@ impl Graph {
             edges_start: vec![0 as usize; n],
             total_pop: 0,
             attr: HashMap::new(),
+            edge_attr: HashMap::new(),
         }
     }
 
@@ -171,6 +176,7 @@ impl Graph {
             edges: edges,
             edges_start: edges_start,
             attr: HashMap::new(),
+            edge_attr: HashMap::new(),
         })
     }
 
@@ -214,6 +220,7 @@ impl Graph {
             edges_start: edges_start,
             total_pop: size as u32,
             attr: HashMap::new(),
+            edge_attr: HashMap::new(),
         }
     }
 
@@ -225,6 +232,9 @@ impl Graph {
             adj.clear();
         }
         self.edges.clear();
+        for vals in self.edge_attr.values_mut() {
+            vals.clear();
+        }
 
         // TODO: These technically shouldn't have to be cleared.
         // However, not clearing them explictly could make debugging harder;
