@@ -17,7 +17,7 @@ use std::{fs, io};
 fn main() {
     let cli = Command::new("frcw_tilted")
         .version("0.1.3")
-        .author("Parker J. Rule <parker.rule@tufts.edu>")
+        .author("Peter Rock <peter@mggg.org>")
         .about("A tilted run optimizer for redistricting")
         .arg(
             Arg::new("graph_json")
