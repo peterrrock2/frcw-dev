@@ -18,6 +18,7 @@ use super::{
 };
 use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
 use crate::graph::Graph;
+use crate::objectives::IncrementalObjective;
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
 use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
@@ -934,6 +935,557 @@ pub fn multi_tilted_runs(
         params,
         n_threads,
         obj_fn,
+        accept_worse_prob,
+        maximize,
+        None,
+        None,
+        show_progress,
+    )
+}
+
+// =====================================================================
+// Incremental tilted runner
+// =====================================================================
+//
+// The incremental runner mirrors the closure-based runner above, but uses
+// an `IncrementalObjective` to avoid full-district rescoring per candidate.
+//
+// Key differences from the closure runner:
+// - Workers and the main thread each own a cached `ObjectiveState`.
+// - Worker scoring uses `objective.score_proposal(&graph, &state, &proposal)`
+//   without mutating `partition` or `state`.
+// - When a diff is received, both the worker's partition and its state are
+//   updated via `objective.apply_proposal`.
+
+/// Incremental-mode worker buffers (no revert buffer needed).
+struct TiltedWorkerBuffersIncremental {
+    subgraph: SubgraphBuffer,
+    spanning_tree: SpanningTreeBuffer,
+    split: SplitBuffer,
+    proposal: RecomProposal,
+}
+
+impl TiltedWorkerBuffersIncremental {
+    fn new(graph_nodes: usize, buf_size: usize, balance_ub: u32) -> Self {
+        Self {
+            subgraph: SubgraphBuffer::new(graph_nodes, buf_size),
+            spanning_tree: SpanningTreeBuffer::new(buf_size),
+            split: SplitBuffer::new(buf_size, balance_ub as usize),
+            proposal: RecomProposal::new_buffer(buf_size),
+        }
+    }
+}
+
+/// Main-thread state for the incremental tilted chain.
+struct TiltedMainStateIncremental<S: Send + Clone> {
+    step: u64,
+    partition: Partition,
+    objective_state: S,
+    current_score: f64,
+    best_score: f64,
+    pending_counts: SelfLoopCounts,
+}
+
+impl<S: Send + Clone> TiltedMainStateIncremental<S> {
+    fn new(partition: Partition, objective_state: S, current_score: f64) -> Self {
+        Self {
+            step: 0,
+            best_score: current_score,
+            pending_counts: SelfLoopCounts::default(),
+            partition,
+            objective_state,
+            current_score,
+        }
+    }
+
+    fn record_rejections(&mut self, count: usize, score_send: Option<&Sender<TiltedScorePacket>>) {
+        if count == 0 {
+            return;
+        }
+        let first_step = self.step + 1;
+        self.step += count as u64;
+        self.pending_counts
+            .inc_by(SelfLoopReason::TiltedRejection, count);
+        if let Some(send) = score_send {
+            send.send(TiltedScorePacket {
+                first_step,
+                last_step: self.step,
+                score: self.current_score,
+                best_score: self.best_score,
+                terminate: false,
+            })
+            .unwrap();
+        }
+    }
+
+    fn apply_accepted_proposal<O: IncrementalObjective<State = S>>(
+        &mut self,
+        graph: &Graph,
+        objective: &O,
+        accepted: &ScoredProposal,
+        maximize: bool,
+        stats_send: Option<&Sender<TiltedStatsPacket>>,
+        score_send: Option<&Sender<TiltedScorePacket>>,
+    ) {
+        self.step += 1;
+        objective.apply_proposal(graph, &mut self.objective_state, &accepted.proposal);
+        self.partition.update(&accepted.proposal);
+        self.current_score = accepted.score;
+
+        let is_new_best = if maximize {
+            accepted.score > self.best_score
+        } else {
+            accepted.score < self.best_score
+        };
+        if is_new_best {
+            self.best_score = accepted.score;
+        }
+        if let Some(send) = stats_send {
+            send.send(TiltedStatsPacket {
+                step: self.step,
+                proposal: Some(accepted.proposal.clone()),
+                counts: self.pending_counts.clone(),
+                terminate: false,
+            })
+            .unwrap();
+        }
+        self.pending_counts = SelfLoopCounts::default();
+        if let Some(send) = score_send {
+            send.send(TiltedScorePacket {
+                first_step: self.step,
+                last_step: self.step,
+                score: self.current_score,
+                best_score: self.best_score,
+                terminate: false,
+            })
+            .unwrap();
+        }
+    }
+
+    fn send_pending_self_loops(&self, stats_send: Option<&Sender<TiltedStatsPacket>>) {
+        if self.pending_counts.sum() == 0 {
+            return;
+        }
+        if let Some(send) = stats_send {
+            send.send(TiltedStatsPacket {
+                step: self.step,
+                proposal: None,
+                counts: self.pending_counts.clone(),
+                terminate: false,
+            })
+            .unwrap();
+        }
+    }
+}
+
+/// Fills the worker's subgraph buffer for the selected district pair.
+fn fill_pair_subgraph_incremental(
+    graph: &Graph,
+    partition: &Partition,
+    buffers: &mut TiltedWorkerBuffersIncremental,
+    region_aware_attrs: Option<&Vec<String>>,
+    dist_a: usize,
+    dist_b: usize,
+) {
+    if let Some(attrs) = region_aware_attrs {
+        partition.subgraph_with_attr_subset(
+            graph,
+            &mut buffers.subgraph,
+            attrs.iter(),
+            dist_a,
+            dist_b,
+        );
+    } else {
+        partition.subgraph_with_attr(graph, &mut buffers.subgraph, dist_a, dist_b);
+    }
+}
+
+fn start_tilted_worker_incremental<O: IncrementalObjective>(
+    graph: Graph,
+    mut partition: Partition,
+    mut objective_state: O::State,
+    params: RecomParams,
+    objective: O,
+    accept_worse_prob: f64,
+    maximize: bool,
+    rng_seed: u64,
+    buf_size: usize,
+    job_recv: Receiver<TiltedJobPacket>,
+    result_send: Sender<TiltedResultPacket>,
+) {
+    let n = graph.pops.len();
+    let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
+    let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
+    let (mut st_sampler, region_aware_attrs) = make_tilted_sampler(&params, buf_size);
+
+    let mut next: TiltedJobPacket = job_recv.recv().unwrap();
+    while !next.terminate {
+        if let Some(diff) = &next.diff {
+            objective.apply_proposal(&graph, &mut objective_state, diff);
+            partition.update(diff);
+        }
+
+        let result = draw_tilted_result_incremental(
+            &graph,
+            &mut partition,
+            &params,
+            &mut buffers,
+            &mut st_sampler,
+            region_aware_attrs.as_ref(),
+            &objective,
+            &objective_state,
+            next.current_score,
+            accept_worse_prob,
+            maximize,
+            &mut rng,
+        );
+
+        result_send.send(result).unwrap();
+        next = job_recv.recv().unwrap();
+    }
+}
+
+/// Draws one tilted result for an incremental worker. Unlike the closure-based
+/// worker, this does not need to apply/revert the proposal to score -- it
+/// queries the incremental objective directly.
+fn draw_tilted_result_incremental<O: IncrementalObjective>(
+    graph: &Graph,
+    partition: &mut Partition,
+    params: &RecomParams,
+    buffers: &mut TiltedWorkerBuffersIncremental,
+    st_sampler: &mut Box<dyn SpanningTreeSampler>,
+    region_aware_attrs: Option<&Vec<String>>,
+    objective: &O,
+    objective_state: &O::State,
+    current_score: f64,
+    accept_worse_prob: f64,
+    maximize: bool,
+    rng: &mut SmallRng,
+) -> TiltedResultPacket {
+    loop {
+        let Some((dist_a, dist_b)) = uniform_dist_pair(graph, partition, rng) else {
+            continue;
+        };
+
+        fill_pair_subgraph_incremental(
+            graph,
+            partition,
+            buffers,
+            region_aware_attrs,
+            dist_a,
+            dist_b,
+        );
+
+        if !graph_connected(&buffers.subgraph.graph) {
+            continue;
+        }
+
+        st_sampler.random_spanning_tree(&buffers.subgraph.graph, &mut buffers.spanning_tree, rng);
+        let split = random_split(
+            &buffers.subgraph.graph,
+            rng,
+            &buffers.spanning_tree.st,
+            dist_a,
+            dist_b,
+            &mut buffers.split,
+            &mut buffers.proposal,
+            &buffers.subgraph.raw_nodes,
+            params,
+        );
+        if split.is_err() {
+            continue;
+        }
+
+        let new_score = objective.score_proposal(graph, objective_state, &buffers.proposal);
+
+        let is_improvement = if maximize {
+            new_score >= current_score
+        } else {
+            new_score <= current_score
+        };
+        if is_improvement || rng.random::<f64>() < accept_worse_prob {
+            return TiltedResultPacket {
+                rejections: 0,
+                proposals: vec![ScoredProposal {
+                    id: rng.random::<u64>(),
+                    proposal: buffers.proposal.clone(),
+                    score: new_score,
+                }],
+            };
+        }
+
+        return TiltedResultPacket {
+            rejections: 1,
+            proposals: Vec::new(),
+        };
+    }
+}
+
+fn interleave_tilted_round_incremental<O, S>(
+    graph: &Graph,
+    objective: &O,
+    state: &mut TiltedMainStateIncremental<S>,
+    mut loops: usize,
+    mut proposals: Vec<ScoredProposal>,
+    params: &RecomParams,
+    rng: &mut SmallRng,
+    job_sends: &[Sender<TiltedJobPacket>],
+    maximize: bool,
+    stats_send: Option<&Sender<TiltedStatsPacket>>,
+    score_send: Option<&Sender<TiltedScorePacket>>,
+) where
+    O: IncrementalObjective<State = S>,
+    S: Send + Clone,
+{
+    if proposals.is_empty() {
+        let remaining = (params.num_steps - state.step) as usize;
+        state.record_rejections(loops.min(remaining), score_send);
+        send_tilted_jobs(job_sends, None, state.current_score);
+        return;
+    }
+
+    proposals.sort_by_key(|proposal| proposal.id);
+    let mut total = loops + proposals.len();
+    while total > 0 && state.step < params.num_steps {
+        let event = rng.random_range(0..total);
+        if event < loops {
+            state.record_rejections(1, score_send);
+            loops -= 1;
+            total -= 1;
+            continue;
+        }
+
+        let accepted = &proposals[rng.random_range(0..proposals.len())];
+        state.apply_accepted_proposal(graph, objective, accepted, maximize, stats_send, score_send);
+        send_tilted_jobs(job_sends, Some(&accepted.proposal), state.current_score);
+        break;
+    }
+}
+
+fn run_tilted_main_loop_incremental<O, S>(
+    graph: &Graph,
+    objective: &O,
+    state: &mut TiltedMainStateIncremental<S>,
+    params: &RecomParams,
+    n_threads: usize,
+    result_recv: &Receiver<TiltedResultPacket>,
+    job_sends: &[Sender<TiltedJobPacket>],
+    rng: &mut SmallRng,
+    maximize: bool,
+    stats_send: Option<&Sender<TiltedStatsPacket>>,
+    score_send: Option<&Sender<TiltedScorePacket>>,
+    progress_bar: Option<&ProgressBar>,
+) where
+    O: IncrementalObjective<State = S>,
+    S: Send + Clone,
+{
+    if params.num_steps > 0 {
+        send_tilted_jobs(job_sends, None, state.current_score);
+    }
+
+    let progress_chunk = (params.num_steps / 1000 + 1).min(1000);
+    let mut last_drawn = state.step;
+    while state.step < params.num_steps {
+        let (loops, proposals) = collect_tilted_results(result_recv, n_threads);
+        interleave_tilted_round_incremental(
+            graph, objective, state, loops, proposals, params, rng, job_sends, maximize,
+            stats_send, score_send,
+        );
+        if let Some(progress_bar) = progress_bar {
+            if state.step - last_drawn >= progress_chunk || state.step == params.num_steps {
+                progress_bar.set_position(state.step);
+                last_drawn = state.step;
+            }
+        }
+    }
+}
+
+/// Runs a tilted-run optimizer with incremental objective scoring.
+///
+/// Behaves identically to [`multi_tilted_runs_with_writer`] but scores
+/// candidate proposals via [`IncrementalObjective::score_proposal`] instead
+/// of rescoring the entire partition on each call. Each worker (and the main
+/// thread) owns a clone of the objective's cached state, updated in lockstep
+/// with the partition whenever a proposal is accepted.
+pub fn multi_tilted_runs_incremental_with_writer<O>(
+    graph: &Graph,
+    partition: Partition,
+    params: &RecomParams,
+    n_threads: usize,
+    objective: O,
+    accept_worse_prob: f64,
+    maximize: bool,
+    stats_writer: Option<&mut dyn StatsWriter>,
+    score_writer: Option<&mut ScoresWriter>,
+    show_progress: bool,
+) -> Result<Partition, String>
+where
+    O: IncrementalObjective + Send + Clone + 'static,
+    O::State: Send + Clone + 'static,
+{
+    if n_threads == 0 {
+        return Err("n_threads must be at least 1".to_string());
+    }
+
+    let node_ub = node_bound(&graph.pops, params.max_pop);
+
+    let mut job_sends = vec![];
+    let mut job_recvs = vec![];
+    for _ in 0..n_threads {
+        let (s, r): (Sender<TiltedJobPacket>, Receiver<TiltedJobPacket>) = unbounded();
+        job_sends.push(s);
+        job_recvs.push(r);
+    }
+    let (result_send, result_recv): (Sender<TiltedResultPacket>, Receiver<TiltedResultPacket>) =
+        unbounded();
+
+    let initial_state = objective.init(graph, &partition);
+    let current_score = objective.score_state(&initial_state);
+    let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
+    let progress_bar = if show_progress {
+        let progress_bar = ProgressBar::with_draw_target(
+            Some(params.num_steps),
+            indicatif::ProgressDrawTarget::stdout_with_hz(1),
+        );
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:100.cyan/blue} {pos:>10}/{len} ({eta_precise})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        Some(progress_bar)
+    } else {
+        None
+    };
+
+    let scoped_result = scope(|scope| -> Result<Partition, String> {
+        let progress_bar_ref = progress_bar.as_ref();
+        let stats_send = if let Some(writer) = stats_writer {
+            let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
+                unbounded();
+            scope.spawn({
+                let graph = graph.clone();
+                let partition = partition.clone();
+                move |_| start_tilted_stats_writer(graph, partition, writer, recv)
+            });
+            Some(send)
+        } else {
+            None
+        };
+        let score_send = if let Some(writer) = score_writer {
+            let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
+                unbounded();
+            scope.spawn(move |_| start_tilted_score_writer(writer, current_score, recv));
+            Some(send)
+        } else {
+            None
+        };
+
+        for t_idx in 0..n_threads {
+            let rng_seed = params.rng_seed + t_idx as u64 + 1;
+            let job_recv = job_recvs[t_idx].clone();
+            let result_send = result_send.clone();
+            let partition = partition.clone();
+            let worker_state = initial_state.clone();
+            let worker_obj = objective.clone();
+
+            scope.spawn(move |_| {
+                start_tilted_worker_incremental::<O>(
+                    graph.clone(),
+                    partition,
+                    worker_state,
+                    params.clone(),
+                    worker_obj,
+                    accept_worse_prob,
+                    maximize,
+                    rng_seed,
+                    node_ub,
+                    job_recv,
+                    result_send,
+                );
+            });
+        }
+
+        let mut state = TiltedMainStateIncremental::<O::State>::new(
+            partition,
+            initial_state,
+            current_score,
+        );
+        run_tilted_main_loop_incremental(
+            graph,
+            &objective,
+            &mut state,
+            params,
+            n_threads,
+            &result_recv,
+            &job_sends,
+            &mut rng,
+            maximize,
+            stats_send.as_ref(),
+            score_send.as_ref(),
+            progress_bar_ref,
+        );
+
+        state.send_pending_self_loops(stats_send.as_ref());
+        if let Some(send) = &stats_send {
+            send.send(TiltedStatsPacket {
+                step: 0,
+                proposal: None,
+                counts: SelfLoopCounts::default(),
+                terminate: true,
+            })
+            .unwrap();
+        }
+        if let Some(send) = &score_send {
+            send.send(TiltedScorePacket {
+                first_step: 0,
+                last_step: 0,
+                score: 0.0,
+                best_score: 0.0,
+                terminate: true,
+            })
+            .unwrap();
+        }
+        stop_tilted_workers(&job_sends);
+        Ok(state.partition)
+    });
+
+    if let Some(progress_bar) = progress_bar {
+        progress_bar.set_position(params.num_steps);
+        progress_bar.finish_and_clear();
+    }
+
+    match scoped_result {
+        Ok(inner) => inner,
+        Err(_panic) => {
+            Err("multi_tilted_runs_incremental panicked in a worker thread".to_string())
+        }
+    }
+}
+
+/// Runs the incremental tilted-run optimizer without writing chain statistics
+/// or scores.
+pub fn multi_tilted_runs_incremental<O>(
+    graph: &Graph,
+    partition: Partition,
+    params: &RecomParams,
+    n_threads: usize,
+    objective: O,
+    accept_worse_prob: f64,
+    maximize: bool,
+    show_progress: bool,
+) -> Result<Partition, String>
+where
+    O: IncrementalObjective + Send + Clone + 'static,
+    O::State: Send + Clone + 'static,
+{
+    multi_tilted_runs_incremental_with_writer(
+        graph,
+        partition,
+        params,
+        n_threads,
+        objective,
         accept_worse_prob,
         maximize,
         None,

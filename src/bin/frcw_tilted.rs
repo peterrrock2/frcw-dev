@@ -6,8 +6,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 use clap::{value_parser, Arg, ArgAction, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::init::from_networkx;
-use frcw::objectives::{make_objective_fn, required_edge_cols, required_node_cols};
-use frcw::recom::tilted::multi_tilted_runs_with_writer;
+use frcw::objectives::{make_objective, required_edge_cols, required_node_cols};
+use frcw::recom::tilted::multi_tilted_runs_incremental_with_writer;
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{
     AssignmentsOnlyWriter, BenWriter, CanonicalWriter, JSONLWriter, PcompressWriter, ScoresWriter,
@@ -316,7 +316,7 @@ fn main() {
         .get_one::<String>("objective")
         .expect("objective is required")
         .as_str();
-    let objective_fn = make_objective_fn(objective_config);
+    let objective = make_objective(objective_config);
     let edge_cols = required_edge_cols(objective_config);
     for col in required_node_cols(objective_config) {
         if !sum_cols.contains(&col) {
@@ -407,12 +407,12 @@ fn main() {
         .get_one::<String>("scores-output-file")
         .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
-    let output = multi_tilted_runs_with_writer(
+    let output = multi_tilted_runs_incremental_with_writer(
         &graph,
         partition,
         &params,
         n_threads,
-        objective_fn,
+        objective,
         accept_worse_prob,
         maximize,
         stats_writer
