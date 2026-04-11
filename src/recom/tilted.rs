@@ -18,12 +18,11 @@ use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
 use crate::graph::Graph;
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
+use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use serde_json::json;
-use std::collections::HashMap;
 
 /// A unit of work sent from the main thread to a worker.
 struct TiltedJobPacket {
@@ -38,7 +37,7 @@ struct TiltedJobPacket {
 /// The result of one round of work from a worker.
 struct TiltedResultPacket {
     /// Number of tilted-criterion rejections (self-loops).
-    rejections: u64,
+    rejections: usize,
     /// Accepted proposals from this round.
     proposals: Vec<ScoredProposal>,
 }
@@ -98,10 +97,10 @@ struct TiltedMainState {
     partition: Partition,
     /// Objective score of `partition`.
     current_score: f64,
-    /// Best score seen so far, used only for verbose progress output.
+    /// Best score seen so far.
     best_score: f64,
-    /// Best partition seen so far, used only for verbose progress output.
-    best_partition: Partition,
+    /// Tilted rejection counts since the last accepted proposal.
+    pending_counts: SelfLoopCounts,
 }
 
 impl TiltedMainState {
@@ -120,25 +119,54 @@ impl TiltedMainState {
         TiltedMainState {
             step: 0,
             best_score: current_score,
-            best_partition: partition.clone(),
+            pending_counts: SelfLoopCounts::default(),
             partition,
             current_score,
         }
     }
 
-    /// Applies an accepted proposal and updates best-seen progress state.
+    /// Writes the current score state if a score writer was provided.
     ///
     /// # Arguments
     ///
+    /// * `score_writer` - Optional writer for per-step objective scores.
+    fn write_score(&self, score_writer: &mut Option<&mut ScoresWriter>) {
+        if let Some(writer) = score_writer.as_deref_mut() {
+            writer
+                .step(self.step, self.current_score, self.best_score)
+                .unwrap();
+        }
+    }
+
+    /// Records one tilted rejection self-loop.
+    ///
+    /// # Arguments
+    ///
+    /// * `score_writer` - Optional writer for per-step objective scores.
+    fn record_rejection(&mut self, score_writer: &mut Option<&mut ScoresWriter>) {
+        self.step += 1;
+        self.pending_counts.inc(SelfLoopReason::TiltedRejection);
+        self.write_score(score_writer);
+    }
+
+    /// Applies an accepted proposal and writes chain statistics.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - Full graph associated with the chain.
     /// * `accepted` - Proposal selected by the main-thread interleaving step.
     /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-    /// * `verbose` - If true, print a JSONL record when this proposal is a new best.
+    /// * `stats_writer` - Optional writer for chain statistics.
+    /// * `score_writer` - Optional writer for per-step objective scores.
     fn apply_accepted_proposal(
         &mut self,
+        graph: &Graph,
         accepted: &ScoredProposal,
         maximize: bool,
-        verbose: bool,
+        stats_writer: &mut Option<&mut dyn StatsWriter>,
+        score_writer: &mut Option<&mut ScoresWriter>,
     ) {
+        self.step += 1;
         self.partition.update(&accepted.proposal);
         self.current_score = accepted.score;
 
@@ -149,11 +177,20 @@ impl TiltedMainState {
         };
         if is_new_best {
             self.best_score = accepted.score;
-            self.best_partition = self.partition.clone();
-            if verbose {
-                print_best_improvement(self.step, self.best_score, &self.best_partition);
-            }
         }
+        if let Some(writer) = stats_writer.as_deref_mut() {
+            writer
+                .step(
+                    self.step,
+                    graph,
+                    &self.partition,
+                    &accepted.proposal,
+                    &self.pending_counts,
+                )
+                .unwrap();
+        }
+        self.pending_counts = SelfLoopCounts::default();
+        self.write_score(score_writer);
     }
 }
 
@@ -488,7 +525,7 @@ fn collect_tilted_results(
     result_recv: &Receiver<TiltedResultPacket>,
     n_threads: usize,
 ) -> (usize, Vec<ScoredProposal>) {
-    let mut rejections: u64 = 0;
+    let mut rejections = 0;
     let mut proposals = Vec::<ScoredProposal>::new();
 
     for _ in 0..n_threads {
@@ -497,59 +534,44 @@ fn collect_tilted_results(
         proposals.extend(packet.proposals);
     }
 
-    (rejections as usize, proposals)
-}
-
-/// Prints one JSONL record for a new best-seen partition.
-///
-/// # Arguments
-///
-/// * `step` - Chain step at which the improvement occurred.
-/// * `score` - New best score.
-/// * `partition` - New best partition.
-fn print_best_improvement(step: u64, score: f64, partition: &Partition) {
-    println!(
-        "{}",
-        json!({
-            "step": step,
-            "score": score,
-            "assignment": partition.assignments.clone()
-                .into_iter()
-                .enumerate()
-                .collect::<HashMap<usize, u32>>()
-        })
-        .to_string()
-    );
+    (rejections, proposals)
 }
 
 /// Interleaves one batch of worker rejections/proposals into the sequential chain.
 ///
-/// Rejections increment the chain step without changing state. The first accepted
-/// proposal selected by the interleaving is applied and broadcast to workers; the
-/// caller then starts a fresh worker round from that new state.
+/// Rejections increment the chain step without changing state. Accepted proposals
+/// are applied and written through `stats_writer`. Every interleaved event is
+/// written through `score_writer`.
 ///
 /// # Arguments
 ///
 /// * `state` - Main-thread canonical chain state.
 /// * `loops` - Number of worker tilted rejections to interleave as self-loops.
 /// * `proposals` - Worker-accepted proposals to interleave with self-loops.
+/// * `graph` - Full graph associated with the chain.
 /// * `params` - ReCom parameters containing the target step count.
 /// * `rng` - Main-thread RNG used for event interleaving and proposal selection.
 /// * `job_sends` - Worker job channels for broadcasting state updates.
 /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `verbose` - If true, print JSONL on best-seen improvements.
+/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
+/// * `score_writer` - Optional writer for per-step objective scores.
 fn interleave_tilted_round(
     state: &mut TiltedMainState,
     mut loops: usize,
     mut proposals: Vec<ScoredProposal>,
+    graph: &Graph,
     params: &RecomParams,
     rng: &mut SmallRng,
     job_sends: &[Sender<TiltedJobPacket>],
     maximize: bool,
-    verbose: bool,
+    stats_writer: &mut Option<&mut dyn StatsWriter>,
+    score_writer: &mut Option<&mut ScoresWriter>,
 ) {
     if proposals.is_empty() {
-        state.step += loops as u64;
+        let remaining = (params.num_steps - state.step) as usize;
+        for _ in 0..loops.min(remaining) {
+            state.record_rejection(score_writer);
+        }
         send_tilted_jobs(job_sends, None, state.current_score);
         return;
     }
@@ -557,16 +579,16 @@ fn interleave_tilted_round(
     proposals.sort_by_key(|proposal| proposal.id);
     let mut total = loops + proposals.len();
     while total > 0 && state.step < params.num_steps {
-        state.step += 1;
         let event = rng.random_range(0..total);
         if event < loops {
+            state.record_rejection(score_writer);
             loops -= 1;
             total -= 1;
             continue;
         }
 
         let accepted = &proposals[rng.random_range(0..proposals.len())];
-        state.apply_accepted_proposal(accepted, maximize, verbose);
+        state.apply_accepted_proposal(graph, accepted, maximize, stats_writer, score_writer);
         send_tilted_jobs(job_sends, Some(&accepted.proposal), state.current_score);
         break; // need new round (state changed)
     }
@@ -577,23 +599,34 @@ fn interleave_tilted_round(
 /// # Arguments
 ///
 /// * `state` - Main-thread canonical chain state.
+/// * `graph` - Full graph associated with the chain.
 /// * `params` - ReCom parameters containing the target step count.
 /// * `n_threads` - Number of worker packets to collect per round.
 /// * `result_recv` - Shared result channel from all workers.
 /// * `job_sends` - Worker job channels.
 /// * `rng` - Main-thread RNG used for interleaving.
 /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `verbose` - If true, print JSONL on best-seen improvements.
+/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
+/// * `score_writer` - Optional writer for per-step objective scores.
 fn run_tilted_main_loop(
     state: &mut TiltedMainState,
+    graph: &Graph,
     params: &RecomParams,
     n_threads: usize,
     result_recv: &Receiver<TiltedResultPacket>,
     job_sends: &[Sender<TiltedJobPacket>],
     rng: &mut SmallRng,
     maximize: bool,
-    verbose: bool,
+    mut stats_writer: Option<&mut dyn StatsWriter>,
+    mut score_writer: Option<&mut ScoresWriter>,
 ) {
+    if let Some(writer) = stats_writer.as_deref_mut() {
+        writer.init(graph, &state.partition).unwrap();
+    }
+    if let Some(writer) = score_writer.as_deref_mut() {
+        writer.init(state.current_score).unwrap();
+    }
+
     if params.num_steps > 0 {
         send_tilted_jobs(job_sends, None, state.current_score);
     }
@@ -601,8 +634,24 @@ fn run_tilted_main_loop(
     while state.step < params.num_steps {
         let (loops, proposals) = collect_tilted_results(result_recv, n_threads);
         interleave_tilted_round(
-            state, loops, proposals, params, rng, job_sends, maximize, verbose,
+            state,
+            loops,
+            proposals,
+            graph,
+            params,
+            rng,
+            job_sends,
+            maximize,
+            &mut stats_writer,
+            &mut score_writer,
         );
+    }
+
+    if let Some(writer) = stats_writer.as_deref_mut() {
+        writer.close().unwrap();
+    }
+    if let Some(writer) = score_writer.as_deref_mut() {
+        writer.close().unwrap();
     }
 }
 
@@ -623,13 +672,14 @@ fn run_tilted_main_loop(
 /// * `obj_fn` - The objective function.
 /// * `accept_worse_prob` - Probability of accepting a proposal with a worse score.
 /// * `maximize` - If true, higher scores are better. If false, lower scores are better.
-/// * `verbose` - If true, print a JSONL line to stdout on each global best improvement.
+/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
+/// * `score_writer` - Optional writer for per-step objective scores.
 ///
 /// # Returns
 ///
 /// `Ok(partition)` containing the terminal chain state, or `Err` if inputs are
 /// invalid or a scoped worker panics.
-pub fn multi_tilted_runs(
+pub fn multi_tilted_runs_with_writer(
     graph: &Graph,
     partition: Partition,
     params: &RecomParams,
@@ -637,7 +687,8 @@ pub fn multi_tilted_runs(
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
     accept_worse_prob: f64,
     maximize: bool,
-    verbose: bool,
+    stats_writer: Option<&mut dyn StatsWriter>,
+    score_writer: Option<&mut ScoresWriter>,
 ) -> Result<Partition, String> {
     if n_threads == 0 {
         return Err("n_threads must be at least 1".to_string());
@@ -685,13 +736,15 @@ pub fn multi_tilted_runs(
         let mut state = TiltedMainState::new(partition, current_score);
         run_tilted_main_loop(
             &mut state,
+            graph,
             params,
             n_threads,
             &result_recv,
             &job_sends,
             &mut rng,
             maximize,
-            verbose,
+            stats_writer,
+            score_writer,
         );
 
         stop_tilted_workers(&job_sends);
@@ -702,4 +755,31 @@ pub fn multi_tilted_runs(
         Ok(inner) => inner,
         Err(_panic) => Err("multi_tilted_runs panicked in a worker thread".to_string()),
     }
+}
+
+/// Runs a tilted-run optimizer without writing chain statistics or scores.
+///
+/// See [`multi_tilted_runs_with_writer`] for the full implementation and argument
+/// documentation.
+pub fn multi_tilted_runs(
+    graph: &Graph,
+    partition: Partition,
+    params: &RecomParams,
+    n_threads: usize,
+    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
+    accept_worse_prob: f64,
+    maximize: bool,
+    _verbose: bool,
+) -> Result<Partition, String> {
+    multi_tilted_runs_with_writer(
+        graph,
+        partition,
+        params,
+        n_threads,
+        obj_fn,
+        accept_worse_prob,
+        maximize,
+        None,
+        None,
+    )
 }

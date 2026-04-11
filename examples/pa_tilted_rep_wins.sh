@@ -3,6 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="/mnt/efs/h/Dropbox/MADLAB/Git_Repos/peter/frcw-dev"
 GRAPH_JSON="$REPO_ROOT/test_fixtures/graphs/PA_VTDs.json"
+OUTPUT_FILE="${1:-$REPO_ROOT/pa_tilted_rep_wins_assignments.txt}"
+SCORES_OUTPUT_FILE="${2:-$REPO_ROOT/pa_tilted_rep_wins_scores.csv}"
 
 OBJECTIVE='{
   "objective": "election_wins",
@@ -28,4 +30,7 @@ cargo run --release --bin frcw_tilted -- \
   --n-threads 8 \
   --accept-worse-prob 0.05 \
   --objective "$OBJECTIVE" \
-  --maximize true
+  --maximize true \
+  --writer assignments \
+  --output-file "$OUTPUT_FILE" \
+  --scores-output-file "$SCORES_OUTPUT_FILE"

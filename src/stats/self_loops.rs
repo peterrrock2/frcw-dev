@@ -14,6 +14,9 @@ pub enum SelfLoopReason {
     /// Probabilistic rejection based on seam length
     /// (reversible ReCom only).
     SeamLength,
+    /// Probabilistic rejection based on objective score
+    /// (tilted runs only).
+    TiltedRejection,
 }
 
 /// Self-loop statistics since the last accepted proposal.
@@ -95,6 +98,7 @@ impl Serialize for SelfLoopCounts {
                 SelfLoopReason::NonAdjacent => "non_adjacent",
                 SelfLoopReason::NoSplit => "no_split",
                 SelfLoopReason::SeamLength => "seam_length",
+                SelfLoopReason::TiltedRejection => "tilted_rejection",
             };
             state.serialize_field(key, count)?;
         }

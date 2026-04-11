@@ -2,9 +2,13 @@
 use frcw::graph::Graph;
 use frcw::objectives::{make_objective_fn, required_node_cols};
 use frcw::partition::Partition;
-use frcw::recom::tilted::multi_tilted_runs;
+use frcw::recom::tilted::{multi_tilted_runs, multi_tilted_runs_with_writer};
+use frcw::recom::RecomProposal;
 use frcw::recom::{RecomParams, RecomVariant};
+use frcw::stats::{ScoresWriter, SelfLoopCounts, StatsWriter};
 use std::collections::HashSet;
+use std::fs;
+use std::io::Result as IOResult;
 use std::iter::FromIterator;
 
 use rstest::rstest;
@@ -107,6 +111,43 @@ fn dist0_pop_objective(graph: &Graph, partition: &Partition) -> f64 {
         .iter()
         .map(|&n| graph.pops[n] as f64)
         .sum()
+}
+
+struct CountingStatsWriter {
+    init_calls: usize,
+    steps: Vec<(u64, usize)>,
+}
+
+impl CountingStatsWriter {
+    fn new() -> CountingStatsWriter {
+        CountingStatsWriter {
+            init_calls: 0,
+            steps: Vec::new(),
+        }
+    }
+}
+
+impl StatsWriter for CountingStatsWriter {
+    fn init(&mut self, _graph: &Graph, _partition: &Partition) -> IOResult<()> {
+        self.init_calls += 1;
+        Ok(())
+    }
+
+    fn step(
+        &mut self,
+        step: u64,
+        _graph: &Graph,
+        _partition: &Partition,
+        _proposal: &RecomProposal,
+        counts: &SelfLoopCounts,
+    ) -> IOResult<()> {
+        self.steps.push((step, counts.sum()));
+        Ok(())
+    }
+
+    fn close(&mut self) -> IOResult<()> {
+        Ok(())
+    }
 }
 
 // ====================================
@@ -268,6 +309,92 @@ fn test_tilted_returns_terminal_partition_not_best_seen() {
         final_partition.assignments, initial_assignments,
         "tilted runs should return the terminal chain state, not the best-seen plan"
     );
+}
+
+#[test]
+fn test_tilted_stats_writer_records_accepted_steps() {
+    let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
+    let params = RecomParams {
+        min_pop: 5,
+        max_pop: 7,
+        num_steps: 8,
+        rng_seed: RNG_SEED,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let mut stats_writer = CountingStatsWriter::new();
+    multi_tilted_runs_with_writer(
+        &graph,
+        partition,
+        &params,
+        1,
+        dist0_pop_objective,
+        1.0,
+        true,
+        Some(&mut stats_writer),
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats_writer.init_calls, 1);
+    assert_eq!(
+        stats_writer.steps,
+        (1..=params.num_steps)
+            .map(|step| (step, 0))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_tilted_scores_writer_records_every_step() {
+    let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
+    let params = RecomParams {
+        min_pop: 5,
+        max_pop: 7,
+        num_steps: 12,
+        rng_seed: RNG_SEED,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "frcw_tilted_scores_{}_{}.csv",
+        std::process::id(),
+        RNG_SEED
+    ));
+    let output = Box::new(std::io::BufWriter::new(fs::File::create(&path).unwrap()));
+    let mut scores_writer = ScoresWriter::new(output);
+    let final_partition = multi_tilted_runs_with_writer(
+        &graph,
+        partition,
+        &params,
+        1,
+        dist0_pop_objective,
+        0.0,
+        true,
+        None,
+        Some(&mut scores_writer),
+    )
+    .unwrap();
+    let scores = fs::read_to_string(&path).unwrap();
+    let lines = scores.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "step,score,best_score");
+    assert_eq!(lines.len(), params.num_steps as usize + 2);
+
+    let mut previous_best = f64::NEG_INFINITY;
+    for (idx, line) in lines.iter().enumerate().skip(1) {
+        let fields = line.split(',').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].parse::<usize>().unwrap(), idx - 1);
+        let best_score = fields[2].parse::<f64>().unwrap();
+        assert!(best_score >= previous_best);
+        previous_best = best_score;
+    }
+    let final_score = dist0_pop_objective(&graph, &final_partition);
+    let last_fields = lines.last().unwrap().split(',').collect::<Vec<_>>();
+    assert_eq!(last_fields[1].parse::<f64>().unwrap(), final_score);
+
+    fs::remove_file(path).unwrap();
 }
 
 // ===================================

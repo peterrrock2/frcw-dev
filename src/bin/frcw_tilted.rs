@@ -7,12 +7,41 @@ use clap::{value_parser, Arg, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::init::from_networkx;
 use frcw::objectives::{make_objective_fn, required_edge_cols, required_node_cols};
-use frcw::recom::tilted::multi_tilted_runs;
+use frcw::recom::tilted::multi_tilted_runs_with_writer;
 use frcw::recom::{RecomParams, RecomVariant};
+use frcw::stats::{
+    AssignmentsOnlyWriter, BenWriter, CanonicalWriter, JSONLWriter, PcompressWriter, ScoresWriter,
+    StatsWriter, TSVWriter,
+};
 use serde_json::json;
 use sha3::{Digest, Sha3_256};
 use std::path::PathBuf;
 use std::{fs, io};
+
+fn output_buffer(path: &str) -> Box<dyn io::Write + Send> {
+    let path = std::path::Path::new(path);
+    if path.exists() {
+        panic!("Output file already exists.");
+    };
+    Box::new(io::BufWriter::new(fs::File::create(path).unwrap()))
+}
+
+fn make_stats_writer(
+    writer_str: &str,
+    output_buffer: Box<dyn io::Write + Send>,
+) -> Box<dyn StatsWriter> {
+    match writer_str {
+        "tsv" => Box::new(TSVWriter::new(output_buffer)),
+        "jsonl" => Box::new(JSONLWriter::new(false, false, false, output_buffer)),
+        "jsonl-full" => Box::new(JSONLWriter::new(true, false, false, output_buffer)),
+        "pcompress" => Box::new(PcompressWriter::new(output_buffer)),
+        "assignments" => Box::new(AssignmentsOnlyWriter::new(false, output_buffer)),
+        "canonicalized-assignments" => Box::new(AssignmentsOnlyWriter::new(true, output_buffer)),
+        "canonical" => Box::new(CanonicalWriter::new(output_buffer)),
+        "ben" => Box::new(BenWriter::new(output_buffer)),
+        bad => panic!("Parameter error: invalid writer '{}'", bad),
+    }
+}
 
 fn main() {
     let cli = Command::new("frcw_tilted")
@@ -110,6 +139,38 @@ fn main() {
                 .value_parser(value_parser!(bool))
                 .default_value("true")
                 .help("If true, maximize the objective. If false, minimize it."),
+        )
+        .arg(
+            Arg::new("writer")
+                .long("writer")
+                .value_parser(value_parser!(String))
+                .default_value("assignments")
+                .help(
+                    "Writer for chain records when --output-file is provided.\n\
+                    \tassignments (default): TXT output with only assignment vectors\n\
+                    \tcanonicalized-assignments: TXT output with canonicalized assignment vectors\n\
+                    \tcanonical: Standardized JSONL output with assignment vector and sample number\n\
+                    \tjsonl: JSON Lines with basic summary statistics\n\
+                    \tjsonl-full: JSON Lines with basic summary statistics and recombined nodes\n\
+                    \ttsv: Tab-separated proposal statistics\n\
+                    \tpcompress: Compressed binary format for post-processing with pcompress\n\
+                    \tben: Compressed binary format for post-processing with BEN",
+                ),
+        )
+        .arg(
+            Arg::new("output-file")
+                .long("output-file")
+                .short('o')
+                .help(
+                    "Path to write chain records. If omitted, chain records are not written.",
+                ),
+        )
+        .arg(
+            Arg::new("scores-output-file")
+                .long("scores-output-file")
+                .help(
+                    "Path to write per-step objective scores as CSV with step, score, and best_score.",
+                ),
         );
 
     let matches = cli.get_matches();
@@ -131,6 +192,10 @@ fn main() {
     let maximize = *matches
         .get_one::<bool>("maximize")
         .expect("maximize is required");
+    let writer_str = matches
+        .get_one::<String>("writer")
+        .expect("writer has a default value")
+        .as_str();
 
     if tol < 0.0 || tol > 1.0 {
         panic!("Parameter error: '--tol' must be between 0 and 1.");
@@ -231,6 +296,19 @@ fn main() {
         "maximize": maximize,
         "graph_json": graph_json,
     });
+    if let Some(path) = matches.get_one::<String>("output-file") {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("output_file".to_string(), json!(path));
+        meta.as_object_mut()
+            .unwrap()
+            .insert("writer".to_string(), json!(writer_str));
+    }
+    if let Some(path) = matches.get_one::<String>("scores-output-file") {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("scores_output_file".to_string(), json!(path));
+    }
     if region_weights.is_some() {
         meta.as_object_mut()
             .unwrap()
@@ -238,7 +316,21 @@ fn main() {
     }
     println!("{}", json!({ "meta": meta }).to_string());
 
-    let output = multi_tilted_runs(
+    let mut stats_writer: Option<Box<dyn StatsWriter>> =
+        match matches.get_one::<String>("output-file") {
+            Some(path) => Some(make_stats_writer(writer_str, output_buffer(path))),
+            None => {
+                if writer_str != "assignments" {
+                    panic!("Parameter error: '--writer' requires '--output-file'.");
+                }
+                None
+            }
+        };
+    let mut scores_writer: Option<ScoresWriter> = matches
+        .get_one::<String>("scores-output-file")
+        .map(|path| ScoresWriter::new(output_buffer(path)));
+
+    let output = multi_tilted_runs_with_writer(
         &graph,
         partition,
         &params,
@@ -246,7 +338,10 @@ fn main() {
         objective_fn,
         accept_worse_prob,
         maximize,
-        true,
+        stats_writer
+            .as_mut()
+            .map(|writer| &mut **writer as &mut dyn StatsWriter),
+        scores_writer.as_mut(),
     );
 
     match output {

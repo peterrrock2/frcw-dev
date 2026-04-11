@@ -103,6 +103,12 @@ pub struct JSONLWriter {
     output: Box<dyn Write + Send>,
 }
 
+/// Writes objective scores for every step of a tilted chain.
+pub struct ScoresWriter {
+    /// The output stream that we would like to write to.
+    output: Box<dyn Write + Send>,
+}
+
 impl TSVWriter {
     pub fn new(output: Box<dyn Write + Send>) -> TSVWriter {
         TSVWriter { output: output }
@@ -206,11 +212,34 @@ impl JSONLWriter {
     fn step_spanning_tree_counts(_graph: &Graph, _proposal: &RecomProposal, _stats: &mut Value) {}
 }
 
+impl ScoresWriter {
+    pub fn new(output: Box<dyn Write + Send>) -> ScoresWriter {
+        ScoresWriter { output }
+    }
+
+    /// Writes the CSV header and the initial score at step 0.
+    pub fn init(&mut self, score: f64) -> Result<()> {
+        self.output.write_all(b"step,score,best_score\n")?;
+        self.step(0, score, score)
+    }
+
+    /// Writes the current and best-so-far objective scores for one chain step.
+    pub fn step(&mut self, step: u64, score: f64, best_score: f64) -> Result<()> {
+        self.output
+            .write_all(format!("{},{},{}\n", step, score, best_score).as_bytes())
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        self.output.flush()
+    }
+}
+
 impl StatsWriter for TSVWriter {
     fn init(&mut self, _graph: &Graph, _partition: &Partition) -> Result<()> {
         // TSV column header.
-        print!("step\tnon_adjacent\tno_split\tseam_length\ta_label\tb_label\t");
-        println!("a_pop\tb_pop\ta_nodes\tb_nodes");
+        self.output.write_all(
+            b"step\tnon_adjacent\tno_split\tseam_length\ttilted_rejection\ta_label\tb_label\ta_pop\tb_pop\ta_nodes\tb_nodes\n",
+        )?;
         Ok(())
     }
 
@@ -225,11 +254,12 @@ impl StatsWriter for TSVWriter {
         self.output
             .write_all(
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\n",
                     step,
                     counts.get(SelfLoopReason::NonAdjacent),
                     counts.get(SelfLoopReason::NoSplit),
                     counts.get(SelfLoopReason::SeamLength),
+                    counts.get(SelfLoopReason::TiltedRejection),
                     proposal.a_label,
                     proposal.b_label,
                     proposal.a_pop,
