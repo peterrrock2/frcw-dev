@@ -154,24 +154,6 @@ impl TiltedMainState {
         }
     }
 
-    /// Sends the current score state to the score-writer thread if one exists.
-    ///
-    /// # Arguments
-    ///
-    /// * `score_send` - Optional channel for per-step objective-score records.
-    fn send_score(&self, score_send: Option<&Sender<TiltedScorePacket>>) {
-        if let Some(send) = score_send {
-            send.send(TiltedScorePacket {
-                first_step: self.step,
-                last_step: self.step,
-                score: self.current_score,
-                best_score: self.best_score,
-                terminate: false,
-            })
-            .unwrap();
-        }
-    }
-
     /// Records tilted rejection self-loops.
     ///
     /// # Arguments
@@ -235,7 +217,16 @@ impl TiltedMainState {
             .unwrap();
         }
         self.pending_counts = SelfLoopCounts::default();
-        self.send_score(score_send);
+        if let Some(send) = score_send {
+            send.send(TiltedScorePacket {
+                first_step: self.step,
+                last_step: self.step,
+                score: self.current_score,
+                best_score: self.best_score,
+                terminate: false,
+            })
+            .unwrap();
+        }
     }
 
     /// Sends pending terminal self-loops to the stats-writer thread if one exists.
@@ -630,37 +621,6 @@ fn stop_tilted_workers(job_sends: &[Sender<TiltedJobPacket>]) {
     }
 }
 
-/// Stops the chain-statistics writer thread.
-///
-/// # Arguments
-///
-/// * `send` - Channel sending stats packets to the writer thread.
-fn stop_tilted_stats_writer(send: &Sender<TiltedStatsPacket>) {
-    send.send(TiltedStatsPacket {
-        step: 0,
-        proposal: None,
-        counts: SelfLoopCounts::default(),
-        terminate: true,
-    })
-    .unwrap();
-}
-
-/// Stops the score writer thread.
-///
-/// # Arguments
-///
-/// * `send` - Channel sending score packets to the writer thread.
-fn stop_tilted_score_writer(send: &Sender<TiltedScorePacket>) {
-    send.send(TiltedScorePacket {
-        first_step: 0,
-        last_step: 0,
-        score: 0.0,
-        best_score: 0.0,
-        terminate: true,
-    })
-    .unwrap();
-}
-
 /// Blocks until each worker has returned exactly one round of tilted output.
 ///
 /// # Arguments
@@ -921,10 +881,23 @@ pub fn multi_tilted_runs_with_writer(
 
         state.send_pending_self_loops(stats_send.as_ref());
         if let Some(send) = &stats_send {
-            stop_tilted_stats_writer(send);
+            send.send(TiltedStatsPacket {
+                step: 0,
+                proposal: None,
+                counts: SelfLoopCounts::default(),
+                terminate: true,
+            })
+            .unwrap();
         }
         if let Some(send) = &score_send {
-            stop_tilted_score_writer(send);
+            send.send(TiltedScorePacket {
+                first_step: 0,
+                last_step: 0,
+                score: 0.0,
+                best_score: 0.0,
+                terminate: true,
+            })
+            .unwrap();
         }
         stop_tilted_workers(&job_sends);
         Ok(state.partition)
