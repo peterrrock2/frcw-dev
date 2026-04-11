@@ -247,16 +247,49 @@ impl ScoresWriter {
         ScoresWriter { output }
     }
 
-    /// Writes the CSV header and the initial score at step 0.
-    pub fn init(&mut self, score: f64) -> Result<()> {
-        self.output.write_all(b"step,score,best_score\n")?;
-        self.step(0, score, score)
+    /// Writes the CSV header and the initial score row at step 0.
+    ///
+    /// When `initial_district_scores` is non-empty, the header is extended
+    /// with one column per district (`d_0,d_1,...,d_{N-1}`) and every row
+    /// will carry per-district values. When empty, the legacy
+    /// `step,score,best_score` header is emitted and `step` must be called
+    /// with an empty slice for every chain step.
+    pub fn init(&mut self, score: f64, initial_district_scores: &[f64]) -> Result<()> {
+        if initial_district_scores.is_empty() {
+            self.output.write_all(b"step,score,best_score\n")?;
+        } else {
+            let mut header = String::from("step,score,best_score");
+            for i in 0..initial_district_scores.len() {
+                header.push_str(&format!(",d_{}", i));
+            }
+            header.push('\n');
+            self.output.write_all(header.as_bytes())?;
+        }
+        self.step(0, score, score, initial_district_scores)
     }
 
-    /// Writes the current and best-so-far objective scores for one chain step.
-    pub fn step(&mut self, step: u64, score: f64, best_score: f64) -> Result<()> {
-        self.output
-            .write_all(format!("{},{},{}\n", step, score, best_score).as_bytes())
+    /// Writes the current and best-so-far objective scores for one chain step,
+    /// plus any per-district scores. Pass an empty slice to emit the legacy
+    /// three-column format.
+    pub fn step(
+        &mut self,
+        step: u64,
+        score: f64,
+        best_score: f64,
+        district_scores: &[f64],
+    ) -> Result<()> {
+        if district_scores.is_empty() {
+            self.output
+                .write_all(format!("{},{},{}\n", step, score, best_score).as_bytes())
+        } else {
+            let mut row = format!("{},{},{}", step, score, best_score);
+            for d in district_scores {
+                row.push(',');
+                row.push_str(&format!("{}", d));
+            }
+            row.push('\n');
+            self.output.write_all(row.as_bytes())
+        }
     }
 
     pub fn close(&mut self) -> Result<()> {

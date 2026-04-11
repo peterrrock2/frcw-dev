@@ -28,6 +28,12 @@ pub enum Aggregation {
 /// Largest `f64` strictly smaller than 1.0.
 const ONE_BELOW: f64 = f64::from_bits(1.0f64.to_bits() - 1);
 
+/// Synthetic node-attribute column name used when a `polsby_popper` config
+/// supplies `boundary_perim_col` but omits `perim_col` — the loader writes
+/// the derived total-perimeter values here and the objective reads them back
+/// through the same key.
+const DERIVED_PERIM_COL: &str = "__frcw_derived_perim";
+
 impl Aggregation {
     fn from_str(s: &str) -> Aggregation {
         match s {
@@ -133,15 +139,26 @@ pub enum ObjectiveConfig {
     /// Fields:
     /// - `area_col`: node attribute (float-parseable string) giving precinct area
     /// - `perim_col`: node attribute (float-parseable string) giving the total
-    ///   perimeter of each precinct (including shared boundaries with neighbors)
+    ///   perimeter of each precinct (including shared boundaries with neighbors).
+    ///   Optional in the JSON when `boundary_perim_col` is supplied; the loader
+    ///   derives into a synthetic internal column in that case.
     /// - `shared_perim_col`: edge attribute (`graph.edge_attr`) giving the shared
     ///   perimeter between adjacent precincts; must be loaded via `required_edge_cols`
     ///   and passed to `from_networkx`
+    /// - `boundary_perim_col`: optional node attribute naming each precinct's
+    ///   outer-hull contribution (nonzero only on boundary nodes). When set, the
+    ///   loader will auto-derive the total-perimeter column from
+    ///   `shared_perim_col` plus this boundary column. If `perim_col` is also
+    ///   given, the derived values are written into that column (overwriting
+    ///   any prior value); if `perim_col` is omitted, a synthetic internal
+    ///   column name is used. One of `perim_col` or `boundary_perim_col`
+    ///   must always be set.
     /// - `aggregation`: one of `"mean"`, `"min"`, or `"sum"`
     PolsbyPopper {
         area_col: &'static str,
         perim_col: &'static str,
         shared_perim_col: &'static str,
+        boundary_perim_col: Option<&'static str>,
         aggregation: Aggregation,
     },
 }
@@ -214,6 +231,7 @@ impl ObjectiveConfig {
                 area_col,
                 perim_col,
                 shared_perim_col,
+                boundary_perim_col: _,
                 aggregation,
             } => {
                 let area_vals = graph
@@ -335,10 +353,26 @@ pub fn make_objective(config: &str) -> ObjectiveConfig {
             let agg_str = data["aggregation"]
                 .as_str()
                 .unwrap_or_else(|| panic!("Missing field 'aggregation' in objective config"));
+            let boundary_perim_col = data
+                .get("boundary_perim_col")
+                .and_then(|v| v.as_str())
+                .map(|s| &*Box::leak(s.to_owned().into_boxed_str()) as &'static str);
+            let perim_col: &'static str = match data.get("perim_col").and_then(|v| v.as_str()) {
+                Some(s) => &*Box::leak(s.to_owned().into_boxed_str()),
+                None => {
+                    if boundary_perim_col.is_none() {
+                        panic!(
+                            "polsby_popper config must set 'perim_col' (pre-baked total perimeter column) or 'boundary_perim_col' (auto-derive from shared_perim + boundary_perim)."
+                        );
+                    }
+                    DERIVED_PERIM_COL
+                }
+            };
             ObjectiveConfig::PolsbyPopper {
                 area_col: leak_str(&data, "area_col"),
-                perim_col: leak_str(&data, "perim_col"),
+                perim_col,
                 shared_perim_col: leak_str(&data, "shared_perim_col"),
+                boundary_perim_col,
                 aggregation: Aggregation::from_str(agg_str),
             }
         }
@@ -360,6 +394,100 @@ pub fn make_objective_fn(config: &str) -> impl Fn(&Graph, &Partition) -> f64 + S
     move |graph: &Graph, partition: &Partition| -> f64 { obj.score(graph, partition) }
 }
 
+/// Inspects a `polsby_popper` objective config for the auto-derivation
+/// triple `(perim_col, boundary_perim_col, shared_perim_col)`.
+///
+/// Returns `Some(...)` iff the objective is `polsby_popper` and carries a
+/// `boundary_perim_col` field, in which case the CLI should call
+/// [`ensure_derived_perim_column`] on the loaded graph before running the
+/// chain. Returns `None` for every other objective and for Polsby-Popper
+/// configs that omit `boundary_perim_col`.
+pub fn polsby_popper_autoderive(config: &str) -> Option<(String, String, String)> {
+    let data: Value = serde_json::from_str(config).ok()?;
+    if data.get("objective").and_then(|v| v.as_str())? != "polsby_popper" {
+        return None;
+    }
+    let boundary = data
+        .get("boundary_perim_col")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let perim = data
+        .get("perim_col")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DERIVED_PERIM_COL.to_string());
+    let shared = data
+        .get("shared_perim_col")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    Some((perim, boundary, shared))
+}
+
+/// Derives a node-level total perimeter column in-place on `graph` from the
+/// per-edge `shared_perim_col` and per-node `boundary_perim_col`.
+///
+/// For each node `n`, writes `graph.attr[perim_col][n]` =
+/// `boundary_perim[n] + sum(shared_perim[edge] for edges incident to n)`,
+/// where missing or non-numeric boundary entries are treated as zero. This
+/// reconstructs the total geometric perimeter of each precinct (outer-hull
+/// contribution plus shared boundary with every neighbor) that
+/// `ObjectiveConfig::PolsbyPopper` expects as `perim_col`.
+///
+/// Any prior value stored under `perim_col` is overwritten. `shared_perim_col`
+/// must already exist in `graph.edge_attr` (loaded via `required_edge_cols`);
+/// `boundary_perim_col` must already exist in `graph.attr`.
+pub fn ensure_derived_perim_column(
+    graph: &mut Graph,
+    perim_col: &str,
+    boundary_perim_col: &str,
+    shared_perim_col: &str,
+) {
+    let shared_perim_vals: Vec<f64> = graph
+        .edge_attr
+        .get(shared_perim_col)
+        .unwrap_or_else(|| {
+            panic!(
+                "Cannot derive '{}': missing edge attribute '{}'",
+                perim_col, shared_perim_col
+            )
+        })
+        .clone();
+    let boundary_vals: Vec<f64> = graph
+        .attr
+        .get(boundary_perim_col)
+        .unwrap_or_else(|| {
+            panic!(
+                "Cannot derive '{}': missing node attribute '{}'",
+                perim_col, boundary_perim_col
+            )
+        })
+        .iter()
+        .map(|s| s.parse::<f64>().unwrap_or(0.0))
+        .collect();
+
+    let n = graph.pops.len();
+    assert_eq!(
+        boundary_vals.len(),
+        n,
+        "boundary_perim column length does not match node count"
+    );
+    assert_eq!(
+        shared_perim_vals.len(),
+        graph.edges.len(),
+        "shared_perim column length does not match edge count"
+    );
+
+    let mut perim_vals = boundary_vals;
+    for (edge_idx, edge) in graph.edges.iter().enumerate() {
+        let w = shared_perim_vals[edge_idx];
+        perim_vals[edge.0] += w;
+        perim_vals[edge.1] += w;
+    }
+
+    let as_strings: Vec<String> = perim_vals.iter().map(|v| format!("{}", v)).collect();
+    graph.attr.insert(perim_col.to_string(), as_strings);
+}
+
 /// Returns the node attribute columns required by the given objective config.
 ///
 /// Use this in CLI binaries to ensure these columns are included in the
@@ -379,10 +507,44 @@ pub fn required_node_cols(config: &str) -> Vec<String> {
             }
             cols
         }
-        "polsby_popper" => vec![
-            data["area_col"].as_str().unwrap().to_string(),
-            data["perim_col"].as_str().unwrap().to_string(),
-        ],
+        "polsby_popper" => {
+            let mut cols = vec![data["area_col"].as_str().unwrap().to_string()];
+            if data.get("boundary_perim_col").and_then(|v| v.as_str()).is_none() {
+                let perim = data
+                    .get("perim_col")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "polsby_popper config must set 'perim_col' or 'boundary_perim_col'."
+                        )
+                    });
+                cols.push(perim.to_string());
+            }
+            cols
+        }
+        _ => vec![],
+    }
+}
+
+/// Returns the node attribute columns that the objective config references
+/// but which may be absent on some nodes. These should be passed to
+/// [`frcw::init::from_networkx`] as `partial_columns`: missing entries are
+/// stored as `"null"` rather than panicking.
+///
+/// Today this only returns Polsby-Popper's `boundary_perim_col` (when set),
+/// because boundary perimeter is by definition defined only on boundary
+/// nodes.
+pub fn partial_node_cols(config: &str) -> Vec<String> {
+    let data: Value = match serde_json::from_str(config) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    match data.get("objective").and_then(|v| v.as_str()) {
+        Some("polsby_popper") => data
+            .get("boundary_perim_col")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -488,6 +650,14 @@ pub trait IncrementalObjective: Send + Clone {
         state: &mut Self::State,
         proposal: &RecomProposal,
     );
+
+    /// Returns a per-district score vector describing `state`, suitable for
+    /// emitting alongside the aggregate score. The length of the returned
+    /// vector should equal the partition's district count for objectives that
+    /// have a natural per-district decomposition (e.g. Polsby-Popper); an
+    /// empty vector indicates the objective does not expose per-district
+    /// values.
+    fn district_scores(&self, state: &Self::State) -> Vec<f64>;
 
     /// Convenience: score a full partition from scratch via the cached path.
     fn score_partition(&self, graph: &Graph, partition: &Partition) -> f64 {
@@ -803,6 +973,7 @@ impl IncrementalObjective for ObjectiveConfig {
                 area_col,
                 perim_col,
                 shared_perim_col,
+                boundary_perim_col: _,
                 aggregation,
             } => ObjectiveState::PolsbyPopper(PolsbyPopperState::init(
                 graph,
@@ -861,6 +1032,7 @@ impl IncrementalObjective for ObjectiveConfig {
                     area_col,
                     perim_col,
                     shared_perim_col,
+                    boundary_perim_col: _,
                     aggregation,
                 },
                 ObjectiveState::PolsbyPopper(state),
@@ -914,6 +1086,7 @@ impl IncrementalObjective for ObjectiveConfig {
                     area_col,
                     perim_col,
                     shared_perim_col,
+                    boundary_perim_col: _,
                     aggregation,
                 },
                 ObjectiveState::PolsbyPopper(s),
@@ -926,6 +1099,22 @@ impl IncrementalObjective for ObjectiveConfig {
                 *aggregation,
                 proposal,
             ),
+            _ => panic!("Objective/state variant mismatch"),
+        }
+    }
+
+    fn district_scores(&self, state: &ObjectiveState) -> Vec<f64> {
+        match (self, state) {
+            (ObjectiveConfig::PolsbyPopper { .. }, ObjectiveState::PolsbyPopper(s)) => {
+                s.district_scores.clone()
+            }
+            (ObjectiveConfig::GinglesPartial { .. }, ObjectiveState::GinglesPartial(s)) => s
+                .min_pops
+                .iter()
+                .zip(s.total_pops.iter())
+                .map(|(&m, &t)| if t == 0 { 0.0 } else { m as f64 / t as f64 })
+                .collect(),
+            (ObjectiveConfig::ElectionWins { .. }, ObjectiveState::ElectionWins(_)) => Vec::new(),
             _ => panic!("Objective/state variant mismatch"),
         }
     }
@@ -1553,6 +1742,7 @@ mod incremental_tests {
             area_col: static_str("area"),
             perim_col: static_str("perim"),
             shared_perim_col: static_str("shared_perim"),
+            boundary_perim_col: None,
             aggregation: Aggregation::Mean,
         }
     }
@@ -1656,9 +1846,76 @@ mod incremental_tests {
             area_col: static_str("area"),
             perim_col: static_str("perim"),
             shared_perim_col: static_str("shared_perim"),
+            boundary_perim_col: None,
             aggregation: Aggregation::Min,
         };
         run_equivalence_suite(obj);
+    }
+
+    #[test]
+    fn ensure_derived_perim_column_matches_hand_computation() {
+        // 2x2 rect grid. Column-major node layout:
+        //   0 (0,0)  2 (1,0)
+        //   1 (0,1)  3 (1,1)
+        // Graph::rect_grid emits edges in sorted (low, high) order per source.
+        // For 2x2, the edges are: (0,1), (0,2), (1,3), (2,3).
+        let mut graph = Graph::rect_grid(2, 2);
+
+        // Each boundary node contributes 1.0 of outer perimeter.
+        let boundary: Vec<String> = (0..graph.pops.len()).map(|_| "1".to_string()).collect();
+        graph.attr.insert("boundary_perim".to_string(), boundary);
+
+        // Distinct shared_perim weights so we can tell which edges contributed.
+        let shared: Vec<f64> = vec![2.0, 3.0, 4.0, 5.0];
+        graph.edge_attr.insert("shared_perim".to_string(), shared);
+
+        ensure_derived_perim_column(
+            &mut graph,
+            "perim",
+            "boundary_perim",
+            "shared_perim",
+        );
+
+        let perim: Vec<f64> = graph
+            .attr
+            .get("perim")
+            .unwrap()
+            .iter()
+            .map(|s| s.parse::<f64>().unwrap())
+            .collect();
+
+        // Expected per node: boundary (=1) + sum of shared_perim for incident edges.
+        // Edges sorted: e0=(0,1)=2, e1=(0,2)=3, e2=(1,3)=4, e3=(2,3)=5.
+        // node 0: 1 + 2 + 3 = 6
+        // node 1: 1 + 2 + 4 = 7
+        // node 2: 1 + 3 + 5 = 9
+        // node 3: 1 + 4 + 5 = 10
+        assert_close(perim[0], 6.0, "perim[0]");
+        assert_close(perim[1], 7.0, "perim[1]");
+        assert_close(perim[2], 9.0, "perim[2]");
+        assert_close(perim[3], 10.0, "perim[3]");
+    }
+
+    #[test]
+    fn polsby_popper_district_scores_match_state() {
+        let (graph, partition) = make_test_graph_and_partition();
+        let obj = test_polsby_popper_config();
+        let state = obj.init(&graph, &partition);
+        let scores = obj.district_scores(&state);
+
+        // Per-district scores should equal polsby_popper_score(area, perim)
+        // computed on the initial state's cached per-district values.
+        if let ObjectiveState::PolsbyPopper(s) = &state {
+            assert_eq!(scores.len(), s.district_scores.len());
+            for (i, &got) in scores.iter().enumerate() {
+                assert_close(got, s.district_scores[i], "district_scores[i]");
+            }
+            // Mean aggregation equals the overall score.
+            let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+            assert_close(mean, s.score, "mean == aggregate");
+        } else {
+            panic!("wrong state variant");
+        }
     }
 
     #[test]

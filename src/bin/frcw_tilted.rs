@@ -6,7 +6,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 use clap::{value_parser, Arg, ArgAction, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::init::from_networkx;
-use frcw::objectives::{make_objective, required_edge_cols, required_node_cols};
+use frcw::objectives::{
+    ensure_derived_perim_column, make_objective, partial_node_cols, polsby_popper_autoderive,
+    required_edge_cols, required_node_cols,
+};
 use frcw::recom::tilted::multi_tilted_runs_incremental_with_writer;
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{
@@ -128,6 +131,18 @@ fn main() {
                 .num_args(1..)
                 .default_value(None)
                 .help("Additional columns in the graph metadata to sum over districts."),
+        )
+        .arg(
+            Arg::new("partial_sum_cols")
+                .long("partial-sum-cols")
+                .value_parser(value_parser!(Option<String>))
+                .num_args(1..)
+                .default_value(None)
+                .help(
+                    "Additional sum columns that may be missing on some nodes. \
+                    Missing entries are treated as zero instead of causing a load-time panic. \
+                    Use this for attributes that legitimately apply to only a subset of nodes.",
+                ),
         )
         .arg(
             Arg::new("objective")
@@ -301,6 +316,11 @@ fn main() {
         .unwrap_or_default()
         .map(|c| c.to_string())
         .collect();
+    let mut partial_cols: Vec<String> = matches
+        .get_many::<String>("partial_sum_cols")
+        .unwrap_or_default()
+        .map(|c| c.to_string())
+        .collect();
     let region_weights_raw = (*matches.get_one::<String>("region_weights").unwrap()).as_str();
     let region_weights = parse_region_weights_config(region_weights_raw);
     // Add region weight keys to sum_cols so the user doesn't have to specify them twice.
@@ -323,9 +343,31 @@ fn main() {
             sum_cols.push(col);
         }
     }
+    for col in partial_node_cols(objective_config) {
+        if !partial_cols.contains(&col) && !sum_cols.contains(&col) {
+            partial_cols.push(col);
+        }
+    }
 
-    let (graph, partition) =
-        from_networkx(&graph_json, pop_col, assignment_col, sum_cols, edge_cols).unwrap();
+    let (mut graph, partition) = from_networkx(
+        &graph_json,
+        pop_col,
+        assignment_col,
+        sum_cols,
+        partial_cols,
+        edge_cols,
+    )
+    .unwrap();
+    if let Some((perim_col, boundary_perim_col, shared_perim_col)) =
+        polsby_popper_autoderive(objective_config)
+    {
+        ensure_derived_perim_column(
+            &mut graph,
+            &perim_col,
+            &boundary_perim_col,
+            &shared_perim_col,
+        );
+    }
     let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
     let params = RecomParams {
         min_pop: ((1.0 - tol) * avg_pop as f64).ceil() as u32,

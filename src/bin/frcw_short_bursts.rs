@@ -178,8 +178,15 @@ fn main() {
         panic!("Parameter error: '--tol' must be between 0 and 1.");
     }
 
-    let (graph, partition) =
-        from_networkx(&graph_json, pop_col, assignment_col, sum_cols, edge_cols).unwrap();
+    let (graph, partition) = from_networkx(
+        &graph_json,
+        pop_col,
+        assignment_col,
+        sum_cols,
+        vec![],
+        edge_cols,
+    )
+    .unwrap();
     let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
     let params = RecomParams {
         min_pop: ((1.0 - tol) * avg_pop as f64).ceil() as u32,

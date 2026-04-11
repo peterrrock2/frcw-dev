@@ -52,7 +52,15 @@ pub fn fixture_with_attributes(key: &str, columns: Vec<&str>) -> (Graph, Partiti
     // PathBuf -> String: see https://stackoverflow.com/a/42579588
     let path_str = full_path.into_os_string().into_string().unwrap();
     let columns_owned = columns.iter().map(|c| c.to_string()).collect();
-    return from_networkx(&path_str, pop_col, assignment_col, columns_owned, vec![]).unwrap();
+    return from_networkx(
+        &path_str,
+        pop_col,
+        assignment_col,
+        columns_owned,
+        vec![],
+        vec![],
+    )
+    .unwrap();
 }
 
 // TODO: allow for alternate seeds and population columns.

@@ -53,7 +53,14 @@ fn disconnected_districts(graph: &Graph, partition: &Partition) -> Vec<(usize, u
 ///    population. This column should be integer-valued.
 /// * `assignment_col` - A column in the graph JSON corresponding to a
 ///    a seed partition. This column should be integer-valued and 1-indexed.
-/// * `columns` - The node metadata columns to load.
+/// * `columns` - Node metadata columns that must exist on every node. Missing
+///    keys panic — use this for columns a typo in whose name should be caught
+///    at load time.
+/// * `partial_columns` - Node metadata columns that may be missing on some
+///    nodes. Missing keys are stored as the string `"null"`, matching the
+///    serialization of an explicit JSON `null`. Use this for columns that
+///    legitimately apply to only a subset of nodes (e.g. `boundary_perim`
+///    on boundary nodes only).
 /// * `edge_float_cols` - Edge attribute columns to load as `f64` (e.g. `"shared_perim"`).
 ///    Pass an empty `Vec` if no edge attributes are needed.
 pub fn from_networkx(
@@ -61,9 +68,11 @@ pub fn from_networkx(
     pop_col: &str,
     assignment_col: &str,
     columns: Vec<String>,
+    partial_columns: Vec<String>,
     edge_float_cols: Vec<String>,
 ) -> SerdeResult<(Graph, Partition)> {
-    let (graph, data) = match graph_from_networkx(path, pop_col, columns, edge_float_cols) {
+    let (graph, data) =
+        match graph_from_networkx(path, pop_col, columns, partial_columns, edge_float_cols) {
         Ok(v) => v,
         Err(e) => return Err(e),
     };
@@ -152,13 +161,17 @@ pub fn from_networkx(
 /// * `path` - the path of the graph JSON file.
 /// * `pop_col` - The column in the graph JSON corresponding to total node
 ///    population. This column should be integer-valued.
-/// * `columns` - The node metadata columns to load.
+/// * `columns` - Node metadata columns that must exist on every node.
+///    Missing keys panic.
+/// * `partial_columns` - Node metadata columns that may be missing on some
+///    nodes. Missing keys are stored as the string `"null"`.
 /// * `edge_float_cols` - Edge attribute columns to load as `f64` (e.g. `"shared_perim"`).
 ///    Pass an empty `Vec` if no edge attributes are needed.
 pub fn graph_from_networkx(
     path: &str,
     pop_col: &str,
     columns: Vec<String>,
+    partial_columns: Vec<String>,
     edge_float_cols: Vec<String>,
 ) -> SerdeResult<(Graph, Value)> {
     // TODO: should load from a generic buffer.
@@ -185,8 +198,8 @@ pub fn graph_from_networkx(
     let mut edges = Vec::<Edge>::new();
     let mut edges_start = vec![0 as usize; num_nodes];
     let mut attr = HashMap::new();
-    for col in columns.to_vec().into_iter() {
-        attr.insert(col, Vec::<String>::with_capacity(num_nodes));
+    for col in columns.iter().chain(partial_columns.iter()) {
+        attr.insert(col.clone(), Vec::<String>::with_capacity(num_nodes));
     }
 
     for (index, (node, adj)) in raw_nodes.iter().zip(raw_adj.iter()).enumerate() {
@@ -216,13 +229,20 @@ pub fn graph_from_networkx(
             if let Some(data) = attr.get_mut(col) {
                 match node.get(col) {
                     Some(value) => data.push(value.to_string()),
-                    None => {
-                        eprintln!(
-                            "Failed to unwrap at column '{}', value {:?}",
-                            col, node[col]
-                        );
-                        panic!("Unexpected None while unwrapping.");
-                    }
+                    None => panic!(
+                        "Node {} is missing required attribute '{}'. \
+                         If this column applies only to some nodes, pass it \
+                         as a partial column instead.",
+                        index, col
+                    ),
+                }
+            }
+        }
+        for col in partial_columns.iter() {
+            if let Some(data) = attr.get_mut(col) {
+                match node.get(col) {
+                    Some(value) => data.push(value.to_string()),
+                    None => data.push("null".to_string()),
                 }
             }
         }
@@ -357,7 +377,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![]).unwrap();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -389,7 +409,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![]).unwrap();
+        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -421,7 +441,7 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let err = from_networkx(&path_str, "population", "district", vec![], vec![]).unwrap_err();
+        let err = from_networkx(&path_str, "population", "district", vec![], vec![], vec![]).unwrap_err();
         fs::remove_file(path).unwrap();
 
         let msg = err.to_string();

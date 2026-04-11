@@ -80,6 +80,10 @@ struct TiltedScorePacket {
     score: f64,
     /// Best score seen so far for each step in this packet.
     best_score: f64,
+    /// Per-district scores to carry forward from this point on, if the chain
+    /// state changed. `None` on pure-rejection runs, where the writer keeps
+    /// reusing its previously cached vector.
+    district_scores: Option<Vec<f64>>,
     /// A sentinel used to stop the writer thread.
     terminate: bool,
 }
@@ -180,6 +184,7 @@ impl TiltedMainState {
                 last_step: self.step,
                 score: self.current_score,
                 best_score: self.best_score,
+                district_scores: None,
                 terminate: false,
             })
             .unwrap();
@@ -230,6 +235,7 @@ impl TiltedMainState {
                 last_step: self.step,
                 score: self.current_score,
                 best_score: self.best_score,
+                district_scores: None,
                 terminate: false,
             })
             .unwrap();
@@ -515,17 +521,29 @@ fn start_tilted_stats_writer(
 ///
 /// * `writer` - Score writer receiving per-step objective scores.
 /// * `initial_score` - Objective score of the starting partition.
+/// * `initial_district_scores` - Per-district score vector for the starting
+///   partition. An empty vector switches the writer to the legacy three-column
+///   `step,score,best_score` output; a non-empty vector emits
+///   `step,score,best_score,d_0,...,d_{N-1}` and the writer caches it so
+///   pure-rejection packets can replay the last-known district scores.
 /// * `recv` - Channel receiving asynchronous score write packets.
 fn start_tilted_score_writer(
     writer: &mut ScoresWriter,
     initial_score: f64,
+    initial_district_scores: Vec<f64>,
     recv: Receiver<TiltedScorePacket>,
 ) {
-    writer.init(initial_score).unwrap();
+    writer.init(initial_score, &initial_district_scores).unwrap();
+    let mut last_districts = initial_district_scores;
     let mut next = recv.recv().unwrap();
     while !next.terminate {
+        if let Some(new_districts) = next.district_scores.take() {
+            last_districts = new_districts;
+        }
         for step in next.first_step..=next.last_step {
-            writer.step(step, next.score, next.best_score).unwrap();
+            writer
+                .step(step, next.score, next.best_score, &last_districts)
+                .unwrap();
         }
         next = recv.recv().unwrap();
     }
@@ -784,7 +802,9 @@ pub fn multi_tilted_runs_with_writer(
         let score_send = if let Some(writer) = score_writer {
             let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
                 unbounded();
-            scope.spawn(move |_| start_tilted_score_writer(writer, current_score, recv));
+            scope.spawn(move |_| {
+                start_tilted_score_writer(writer, current_score, Vec::new(), recv)
+            });
             Some(send)
         } else {
             None
@@ -843,6 +863,7 @@ pub fn multi_tilted_runs_with_writer(
                 last_step: 0,
                 score: 0.0,
                 best_score: 0.0,
+                district_scores: None,
                 terminate: true,
             })
             .unwrap();
@@ -961,6 +982,7 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
                 last_step: self.step,
                 score: self.current_score,
                 best_score: self.best_score,
+                district_scores: None,
                 terminate: false,
             })
             .unwrap();
@@ -1007,6 +1029,7 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
                 last_step: self.step,
                 score: self.current_score,
                 best_score: self.best_score,
+                district_scores: Some(objective.district_scores(&self.objective_state)),
                 terminate: false,
             })
             .unwrap();
@@ -1283,6 +1306,7 @@ where
 
     let initial_state = objective.init(graph, &partition);
     let current_score = objective.score_state(&initial_state);
+    let initial_district_scores = objective.district_scores(&initial_state);
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
     let progress_bar = if show_progress {
         let progress_bar = ProgressBar::with_draw_target(
@@ -1317,7 +1341,9 @@ where
         let score_send = if let Some(writer) = score_writer {
             let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
                 unbounded();
-            scope.spawn(move |_| start_tilted_score_writer(writer, current_score, recv));
+            scope.spawn(move |_| {
+                start_tilted_score_writer(writer, current_score, initial_district_scores, recv)
+            });
             Some(send)
         } else {
             None
@@ -1384,6 +1410,7 @@ where
                 last_step: 0,
                 score: 0.0,
                 best_score: 0.0,
+                district_scores: None,
                 terminate: true,
             })
             .unwrap();
