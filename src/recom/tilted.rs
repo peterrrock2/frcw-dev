@@ -212,12 +212,13 @@ impl TiltedMainState {
             send.send(TiltedStatsPacket {
                 step: self.step,
                 proposal: Some(accepted.proposal.clone()),
-                counts: self.pending_counts.clone(),
+                counts: std::mem::take(&mut self.pending_counts),
                 terminate: false,
             })
             .unwrap();
+        } else {
+            self.pending_counts = SelfLoopCounts::default();
         }
-        self.pending_counts = SelfLoopCounts::default();
         if let Some(send) = score_send {
             send.send(TiltedScorePacket {
                 first_step: self.step,
@@ -276,6 +277,45 @@ fn graph_connected(graph: &Graph) -> bool {
                 visited[neighbor] = true;
                 seen += 1;
                 stack.push(neighbor);
+            }
+        }
+    }
+    seen == n
+}
+
+/// Scratch buffers for repeated connectivity checks.
+struct ConnectivityBuffers {
+    visited: Vec<bool>,
+    stack: Vec<usize>,
+}
+
+impl ConnectivityBuffers {
+    fn new(capacity: usize) -> Self {
+        Self {
+            visited: Vec::with_capacity(capacity),
+            stack: Vec::with_capacity(capacity),
+        }
+    }
+}
+
+/// Variant of [`graph_connected`] that reuses caller-owned scratch buffers.
+fn graph_connected_buffered(graph: &Graph, bufs: &mut ConnectivityBuffers) -> bool {
+    let n = graph.pops.len();
+    if n <= 1 {
+        return true;
+    }
+    bufs.visited.clear();
+    bufs.visited.resize(n, false);
+    bufs.stack.clear();
+    bufs.visited[0] = true;
+    bufs.stack.push(0);
+    let mut seen = 1;
+    while let Some(node) = bufs.stack.pop() {
+        for &neighbor in graph.neighbors[node].iter() {
+            if !bufs.visited[neighbor] {
+                bufs.visited[neighbor] = true;
+                seen += 1;
+                bufs.stack.push(neighbor);
             }
         }
     }
@@ -538,22 +578,22 @@ fn start_tilted_worker(
 /// * `writer` - Stats writer receiving accepted proposals and self-loop counts.
 /// * `recv` - Channel receiving asynchronous stats write packets.
 fn start_tilted_stats_writer(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     writer: &mut dyn StatsWriter,
     recv: Receiver<TiltedStatsPacket>,
 ) {
-    writer.init(&graph, &partition).unwrap();
+    writer.init(graph, &partition).unwrap();
     let mut next = recv.recv().unwrap();
     while !next.terminate {
         if let Some(proposal) = next.proposal {
             partition.update(&proposal);
             writer
-                .step(next.step, &graph, &partition, &proposal, &next.counts)
+                .step(next.step, graph, &partition, &proposal, &next.counts)
                 .unwrap();
         } else {
             writer
-                .self_loop(next.step, &graph, &partition, &next.counts)
+                .self_loop(next.step, graph, &partition, &next.counts)
                 .unwrap();
         }
         next = recv.recv().unwrap();
@@ -826,7 +866,6 @@ pub fn multi_tilted_runs_with_writer(
             let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
                 unbounded();
             scope.spawn({
-                let graph = graph.clone();
                 let partition = partition.clone();
                 move |_| start_tilted_stats_writer(graph, partition, writer, recv)
             });
@@ -963,6 +1002,7 @@ struct TiltedWorkerBuffersIncremental {
     spanning_tree: SpanningTreeBuffer,
     split: SplitBuffer,
     proposal: RecomProposal,
+    connectivity: ConnectivityBuffers,
 }
 
 impl TiltedWorkerBuffersIncremental {
@@ -972,6 +1012,7 @@ impl TiltedWorkerBuffersIncremental {
             spanning_tree: SpanningTreeBuffer::new(buf_size),
             split: SplitBuffer::new(buf_size, balance_ub as usize),
             proposal: RecomProposal::new_buffer(buf_size),
+            connectivity: ConnectivityBuffers::new(buf_size),
         }
     }
 }
@@ -1029,7 +1070,8 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
     ) {
         self.step += 1;
         objective.apply_proposal(graph, &mut self.objective_state, &accepted.proposal);
-        self.partition.update(&accepted.proposal);
+        self.partition
+            .update_with_dist_adj(&accepted.proposal, graph);
         self.current_score = accepted.score;
 
         let is_new_best = if maximize {
@@ -1044,12 +1086,13 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
             send.send(TiltedStatsPacket {
                 step: self.step,
                 proposal: Some(accepted.proposal.clone()),
-                counts: self.pending_counts.clone(),
+                counts: std::mem::take(&mut self.pending_counts),
                 terminate: false,
             })
             .unwrap();
+        } else {
+            self.pending_counts = SelfLoopCounts::default();
         }
-        self.pending_counts = SelfLoopCounts::default();
         if let Some(send) = score_send {
             send.send(TiltedScorePacket {
                 first_step: self.step,
@@ -1079,29 +1122,23 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
 }
 
 /// Fills the worker's subgraph buffer for the selected district pair.
+///
+/// The incremental objective reads its inputs from the parent graph via cached
+/// state, and the region-aware sampler reads region weights off the parent
+/// graph via `raw_nodes`, so the pair subgraph never needs its own copy of
+/// node attribute columns.
 fn fill_pair_subgraph_incremental(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffersIncremental,
-    region_aware_attrs: Option<&Vec<String>>,
     dist_a: usize,
     dist_b: usize,
 ) {
-    if let Some(attrs) = region_aware_attrs {
-        partition.subgraph_with_attr_subset(
-            graph,
-            &mut buffers.subgraph,
-            attrs.iter(),
-            dist_a,
-            dist_b,
-        );
-    } else {
-        partition.subgraph_with_attr(graph, &mut buffers.subgraph, dist_a, dist_b);
-    }
+    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 }
 
 fn start_tilted_worker_incremental<O: IncrementalObjective>(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     mut objective_state: O::State,
     params: RecomParams,
@@ -1116,22 +1153,21 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
-    let (mut st_sampler, region_aware_attrs) = make_tilted_sampler(&params, buf_size);
+    let (mut st_sampler, _region_aware_attrs) = make_tilted_sampler(&params, buf_size);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
         if let Some(diff) = &next.diff {
-            objective.apply_proposal(&graph, &mut objective_state, diff);
-            partition.update(diff);
+            objective.apply_proposal(graph, &mut objective_state, diff);
+            partition.update_with_dist_adj(diff, graph);
         }
 
         let result = draw_tilted_result_incremental(
-            &graph,
+            graph,
             &mut partition,
             &params,
             &mut buffers,
             &mut st_sampler,
-            region_aware_attrs.as_ref(),
             &objective,
             &objective_state,
             next.current_score,
@@ -1154,7 +1190,6 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffersIncremental,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
-    region_aware_attrs: Option<&Vec<String>>,
     objective: &O,
     objective_state: &O::State,
     current_score: f64,
@@ -1167,20 +1202,19 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
             continue;
         };
 
-        fill_pair_subgraph_incremental(
-            graph,
-            partition,
-            buffers,
-            region_aware_attrs,
-            dist_a,
-            dist_b,
-        );
+        fill_pair_subgraph_incremental(graph, partition, buffers, dist_a, dist_b);
 
-        if !graph_connected(&buffers.subgraph.graph) {
+        if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue;
         }
 
-        st_sampler.random_spanning_tree(&buffers.subgraph.graph, &mut buffers.spanning_tree, rng);
+        st_sampler.random_spanning_tree_with_parent(
+            &buffers.subgraph.graph,
+            graph,
+            &buffers.subgraph.raw_nodes,
+            &mut buffers.spanning_tree,
+            rng,
+        );
         let split = random_split(
             &buffers.subgraph.graph,
             rng,
@@ -1365,7 +1399,6 @@ where
             let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
                 unbounded();
             scope.spawn({
-                let graph = graph.clone();
                 let partition = partition.clone();
                 move |_| start_tilted_stats_writer(graph, partition, writer, recv)
             });
@@ -1392,7 +1425,7 @@ where
 
             scope.spawn(move |_| {
                 start_tilted_worker_incremental::<O>(
-                    graph.clone(),
+                    graph,
                     partition,
                     worker_state,
                     params.clone(),
