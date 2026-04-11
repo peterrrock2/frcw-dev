@@ -237,6 +237,26 @@ impl TiltedMainState {
         self.pending_counts = SelfLoopCounts::default();
         self.send_score(score_send);
     }
+
+    /// Sends pending terminal self-loops to the stats-writer thread if one exists.
+    ///
+    /// # Arguments
+    ///
+    /// * `stats_send` - Optional channel for accepted proposal statistics.
+    fn send_pending_self_loops(&self, stats_send: Option<&Sender<TiltedStatsPacket>>) {
+        if self.pending_counts.sum() == 0 {
+            return;
+        }
+        if let Some(send) = stats_send {
+            send.send(TiltedStatsPacket {
+                step: self.step,
+                proposal: None,
+                counts: self.pending_counts.clone(),
+                terminate: false,
+            })
+            .unwrap();
+        }
+    }
 }
 
 /// Returns true iff `graph` has exactly one connected component.
@@ -534,11 +554,16 @@ fn start_tilted_stats_writer(
     writer.init(&graph, &partition).unwrap();
     let mut next = recv.recv().unwrap();
     while !next.terminate {
-        let proposal = next.proposal.unwrap();
-        partition.update(&proposal);
-        writer
-            .step(next.step, &graph, &partition, &proposal, &next.counts)
-            .unwrap();
+        if let Some(proposal) = next.proposal {
+            partition.update(&proposal);
+            writer
+                .step(next.step, &graph, &partition, &proposal, &next.counts)
+                .unwrap();
+        } else {
+            writer
+                .self_loop(next.step, &graph, &partition, &next.counts)
+                .unwrap();
+        }
         next = recv.recv().unwrap();
     }
     writer.close().unwrap();
@@ -894,6 +919,7 @@ pub fn multi_tilted_runs_with_writer(
             progress_bar_ref,
         );
 
+        state.send_pending_self_loops(stats_send.as_ref());
         if let Some(send) = &stats_send {
             stop_tilted_stats_writer(send);
         }

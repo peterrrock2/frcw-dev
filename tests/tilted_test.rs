@@ -5,7 +5,8 @@ use frcw::partition::Partition;
 use frcw::recom::tilted::{multi_tilted_runs, multi_tilted_runs_with_writer};
 use frcw::recom::RecomProposal;
 use frcw::recom::{RecomParams, RecomVariant};
-use frcw::stats::{ScoresWriter, SelfLoopCounts, StatsWriter};
+use frcw::stats::{CanonicalWriter, ScoresWriter, SelfLoopCounts, StatsWriter};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Result as IOResult;
@@ -395,6 +396,71 @@ fn test_tilted_scores_writer_records_every_step() {
     let final_score = dist0_pop_objective(&graph, &final_partition);
     let last_fields = lines.last().unwrap().split(',').collect::<Vec<_>>();
     assert_eq!(last_fields[1].parse::<f64>().unwrap(), final_score);
+
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn test_tilted_canonical_writer_flushes_terminal_self_loops() {
+    let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
+    let initial_assignments = partition.assignments.clone();
+    let initial_assignments_ref = &initial_assignments;
+    let objective = move |_graph: &Graph, p: &Partition| {
+        if p.assignments == *initial_assignments_ref {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let params = RecomParams {
+        min_pop: 5,
+        max_pop: 7,
+        num_steps: 8,
+        rng_seed: RNG_SEED,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "frcw_tilted_canonical_{}_{}.jsonl",
+        std::process::id(),
+        RNG_SEED
+    ));
+    let output = Box::new(std::io::BufWriter::new(fs::File::create(&path).unwrap()));
+    let mut writer = CanonicalWriter::new(output);
+    let final_partition = multi_tilted_runs_with_writer(
+        &graph,
+        partition,
+        &params,
+        1,
+        objective,
+        0.0,
+        true,
+        Some(&mut writer),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let output = fs::read_to_string(&path).unwrap();
+    let records = output
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), params.num_steps as usize + 1);
+    assert_eq!(
+        records.last().unwrap()["sample"].as_u64().unwrap(),
+        params.num_steps
+    );
+    let final_assignment = final_partition
+        .assignments
+        .iter()
+        .map(|assignment| Value::from(*assignment + 1))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.last().unwrap()["assignment"].as_array().unwrap(),
+        &final_assignment
+    );
 
     fs::remove_file(path).unwrap();
 }

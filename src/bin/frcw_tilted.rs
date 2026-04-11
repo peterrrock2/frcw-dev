@@ -15,15 +15,28 @@ use frcw::stats::{
 };
 use serde_json::json;
 use sha3::{Digest, Sha3_256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-fn output_buffer(path: &str) -> Box<dyn io::Write + Send> {
-    let path = std::path::Path::new(path);
-    if path.exists() {
-        panic!("Output file already exists.");
+fn assert_can_write_output(path: &Path, overwrite_output: bool) {
+    if path.exists() && !overwrite_output {
+        panic!("Output file already exists. Use --overwrite-output to replace it.");
     };
+}
+
+fn output_buffer(path: &str, overwrite_output: bool) -> Box<dyn io::Write + Send> {
+    let path = std::path::Path::new(path);
+    assert_can_write_output(path, overwrite_output);
     Box::new(io::BufWriter::new(fs::File::create(path).unwrap()))
+}
+
+fn metadata_path(output_path: &str) -> PathBuf {
+    let output_path = PathBuf::from(output_path);
+    let file_stem = output_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("Output path must have a valid UTF-8 file name.");
+    output_path.with_file_name(format!("{}_metadata.jsonl", file_stem))
 }
 
 fn make_stats_writer(
@@ -173,6 +186,12 @@ fn main() {
                 ),
         )
         .arg(
+            Arg::new("overwrite-output")
+                .long("overwrite-output")
+                .action(ArgAction::SetTrue)
+                .help("Overwrite existing output files instead of failing."),
+        )
+        .arg(
             Arg::new("show-progress")
                 .long("show-progress")
                 .action(ArgAction::SetTrue)
@@ -202,7 +221,43 @@ fn main() {
         .get_one::<String>("writer")
         .expect("writer has a default value")
         .as_str();
+    let overwrite_output = matches.get_flag("overwrite-output");
     let show_progress = matches.get_flag("show-progress");
+    let metadata_base_path = matches
+        .get_one::<String>("output-file")
+        .or_else(|| matches.get_one::<String>("scores-output-file"));
+    let metadata_path = metadata_base_path.map(|path| metadata_path(path));
+    if let (Some(output_path), Some(scores_path)) = (
+        matches.get_one::<String>("output-file"),
+        matches.get_one::<String>("scores-output-file"),
+    ) {
+        if PathBuf::from(output_path) == PathBuf::from(scores_path) {
+            panic!(
+                "Parameter error: '--output-file' and '--scores-output-file' must be different."
+            );
+        }
+    }
+    if let Some(metadata_path) = &metadata_path {
+        if matches
+            .get_one::<String>("output-file")
+            .is_some_and(|path| PathBuf::from(path) == *metadata_path)
+            || matches
+                .get_one::<String>("scores-output-file")
+                .is_some_and(|path| PathBuf::from(path) == *metadata_path)
+        {
+            panic!("Parameter error: derived metadata path conflicts with an output path.");
+        }
+    }
+    let output_paths = [
+        matches.get_one::<String>("output-file").map(PathBuf::from),
+        matches
+            .get_one::<String>("scores-output-file")
+            .map(PathBuf::from),
+        metadata_path.clone(),
+    ];
+    for path in output_paths.into_iter().flatten() {
+        assert_can_write_output(&path, overwrite_output);
+    }
 
     if tol < 0.0 || tol > 1.0 {
         panic!("Parameter error: '--tol' must be between 0 and 1.");
@@ -301,6 +356,7 @@ fn main() {
         "type": "tilted_run",
         "accept_worse_prob": accept_worse_prob,
         "maximize": maximize,
+        "overwrite_output": overwrite_output,
         "show_progress": show_progress,
         "graph_json": graph_json,
     });
@@ -317,16 +373,29 @@ fn main() {
             .unwrap()
             .insert("scores_output_file".to_string(), json!(path));
     }
+    if let Some(path) = &metadata_path {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("metadata_file".to_string(), json!(path));
+    }
     if region_weights.is_some() {
         meta.as_object_mut()
             .unwrap()
             .insert("region_weights".to_string(), json!(region_weights));
     }
-    println!("{}", json!({ "meta": meta }).to_string());
+    let mut metadata_writer: Option<Box<dyn io::Write + Send>> = metadata_path
+        .as_ref()
+        .map(|path| output_buffer(path.to_str().unwrap(), overwrite_output));
+    if let Some(writer) = metadata_writer.as_mut() {
+        writeln!(writer, "{}", json!({ "meta": meta })).unwrap();
+    }
 
     let mut stats_writer: Option<Box<dyn StatsWriter>> =
         match matches.get_one::<String>("output-file") {
-            Some(path) => Some(make_stats_writer(writer_str, output_buffer(path))),
+            Some(path) => Some(make_stats_writer(
+                writer_str,
+                output_buffer(path, overwrite_output),
+            )),
             None => {
                 if writer_str != "assignments" {
                     panic!("Parameter error: '--writer' requires '--output-file'.");
@@ -336,7 +405,7 @@ fn main() {
         };
     let mut scores_writer: Option<ScoresWriter> = matches
         .get_one::<String>("scores-output-file")
-        .map(|path| ScoresWriter::new(output_buffer(path)));
+        .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
     let output = multi_tilted_runs_with_writer(
         &graph,
@@ -354,14 +423,7 @@ fn main() {
     );
 
     match output {
-        Ok(final_partition) => {
-            let final_score = objective_fn(&graph, &final_partition);
-            let output = json!({
-                "final_score": final_score,
-                "final_assignment": final_partition.assignments
-            });
-            println!("{}", output.to_string());
-        }
+        Ok(_) => {}
         Err(e) => {
             eprintln!("Error during optimization: {}", e);
         }

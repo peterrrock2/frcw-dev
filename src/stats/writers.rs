@@ -27,6 +27,17 @@ pub trait StatsWriter: Send {
         counts: &SelfLoopCounts,
     ) -> Result<()>;
 
+    /// Prints self-loops after the last accepted proposal.
+    fn self_loop(
+        &mut self,
+        _step: u64,
+        _graph: &Graph,
+        _partition: &Partition,
+        _counts: &SelfLoopCounts,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Cleans up after the last step (useful for testing).
     fn close(&mut self) -> Result<()>;
 }
@@ -56,6 +67,10 @@ pub struct TSVWriter {
 pub struct AssignmentsOnlyWriter {
     /// Determines whether to canonicalize assignment vectors.
     canonicalize: bool,
+    /// The last assignment vector written.
+    previous_assignment: Vec<u32>,
+    /// The last chain step written.
+    last_step: u64,
     /// The output stream that we would like to write to.
     output: Box<dyn Write + Send>,
 }
@@ -120,6 +135,8 @@ impl AssignmentsOnlyWriter {
         AssignmentsOnlyWriter {
             output: output,
             canonicalize: canonicalize,
+            previous_assignment: Vec::new(),
+            last_step: 0,
         }
     }
 
@@ -142,6 +159,19 @@ impl AssignmentsOnlyWriter {
             canon[idx] = dist_mapping[assn as usize];
         }
         canon
+    }
+
+    fn assignment(&self, partition: &Partition) -> Vec<u32> {
+        if self.canonicalize {
+            self.canonicalize_assignments(partition)
+        } else {
+            partition.assignments.clone()
+        }
+    }
+
+    fn write_assignment(&mut self, step: u64, assignment: &[u32]) -> Result<()> {
+        self.output
+            .write_all(format!("{},{:?}\n", step, assignment).as_bytes())
     }
 }
 
@@ -274,7 +304,7 @@ impl StatsWriter for TSVWriter {
     }
 
     fn close(&mut self) -> Result<()> {
-        Ok(())
+        self.output.flush()
     }
 }
 
@@ -342,21 +372,16 @@ impl StatsWriter for JSONLWriter {
     }
 
     fn close(&mut self) -> Result<()> {
-        Ok(())
+        self.output.flush()
     }
 }
 
 impl StatsWriter for AssignmentsOnlyWriter {
     fn init(&mut self, _graph: &Graph, partition: &Partition) -> Result<()> {
-        if self.canonicalize {
-            self.output
-                .write_all(format!("0,{:?}\n", self.canonicalize_assignments(partition)).as_bytes())
-                .expect("Failed to write to output");
-        } else {
-            self.output
-                .write_all(format!("0,{:?}\n", partition.assignments).as_bytes())
-                .expect("Failed to write to output");
-        }
+        let assignment = self.assignment(partition);
+        self.write_assignment(0, &assignment)?;
+        self.previous_assignment = assignment;
+        self.last_step = 0;
         Ok(())
     }
 
@@ -366,24 +391,38 @@ impl StatsWriter for AssignmentsOnlyWriter {
         _graph: &Graph,
         partition: &Partition,
         _proposal: &RecomProposal,
-        _counts: &SelfLoopCounts,
+        counts: &SelfLoopCounts,
     ) -> Result<()> {
-        if self.canonicalize {
-            self.output
-                .write_all(
-                    format!("{},{:?}\n", step, self.canonicalize_assignments(partition)).as_bytes(),
-                )
-                .expect("Failed to write to output");
-        } else {
-            self.output
-                .write_all(format!("{},{:?}\n", step, partition.assignments).as_bytes())
-                .expect("Failed to write to output");
+        debug_assert_eq!(step, self.last_step + counts.sum() as u64 + 1);
+        let previous_assignment = self.previous_assignment.clone();
+        for self_loop_step in self.last_step + 1..step {
+            self.write_assignment(self_loop_step, &previous_assignment)?;
         }
+        let assignment = self.assignment(partition);
+        self.write_assignment(step, &assignment)?;
+        self.previous_assignment = assignment;
+        self.last_step = step;
+        Ok(())
+    }
+
+    fn self_loop(
+        &mut self,
+        step: u64,
+        _graph: &Graph,
+        _partition: &Partition,
+        counts: &SelfLoopCounts,
+    ) -> Result<()> {
+        debug_assert_eq!(step, self.last_step + counts.sum() as u64);
+        let previous_assignment = self.previous_assignment.clone();
+        for self_loop_step in self.last_step + 1..=step {
+            self.write_assignment(self_loop_step, &previous_assignment)?;
+        }
+        self.last_step = step;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        Ok(())
+        self.output.flush()
     }
 }
 
@@ -454,8 +493,33 @@ impl StatsWriter for CanonicalWriter {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> {
+    fn self_loop(
+        &mut self,
+        step: u64,
+        _graph: &Graph,
+        _partition: &Partition,
+        counts: &SelfLoopCounts,
+    ) -> Result<()> {
+        let tot_count = counts.sum();
+        for i in step - tot_count as u64 + 1..step + 1 {
+            self.output
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "assignment": self.previous_assignment,
+                            "sample": i,
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .expect("Failed to write to output");
+        }
         Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.output.flush()
     }
 }
 
