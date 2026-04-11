@@ -23,6 +23,7 @@ use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler}
 use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -727,6 +728,7 @@ fn interleave_tilted_round(
 /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
 /// * `stats_send` - Optional channel for accepted proposal statistics.
 /// * `score_send` - Optional channel for per-step objective-score records.
+/// * `progress_bar` - Optional progress bar tracking total chain steps.
 fn run_tilted_main_loop(
     state: &mut TiltedMainState,
     params: &RecomParams,
@@ -737,16 +739,25 @@ fn run_tilted_main_loop(
     maximize: bool,
     stats_send: Option<&Sender<TiltedStatsPacket>>,
     score_send: Option<&Sender<TiltedScorePacket>>,
+    progress_bar: Option<&ProgressBar>,
 ) {
     if params.num_steps > 0 {
         send_tilted_jobs(job_sends, None, state.current_score);
     }
 
+    let progress_chunk = (params.num_steps / 1000 + 1).min(1000);
+    let mut last_drawn = state.step;
     while state.step < params.num_steps {
         let (loops, proposals) = collect_tilted_results(result_recv, n_threads);
         interleave_tilted_round(
             state, loops, proposals, params, rng, job_sends, maximize, stats_send, score_send,
         );
+        if let Some(progress_bar) = progress_bar {
+            if state.step - last_drawn >= progress_chunk || state.step == params.num_steps {
+                progress_bar.set_position(state.step);
+                last_drawn = state.step;
+            }
+        }
     }
 }
 
@@ -770,6 +781,7 @@ fn run_tilted_main_loop(
 /// * `stats_writer` - Optional asynchronous writer for accepted chain proposals
 ///   and self-loop counts.
 /// * `score_writer` - Optional asynchronous writer for per-step objective scores.
+/// * `show_progress` - If true, show a progress bar tracking total chain steps.
 ///
 /// # Returns
 ///
@@ -785,6 +797,7 @@ pub fn multi_tilted_runs_with_writer(
     maximize: bool,
     stats_writer: Option<&mut dyn StatsWriter>,
     score_writer: Option<&mut ScoresWriter>,
+    show_progress: bool,
 ) -> Result<Partition, String> {
     if n_threads == 0 {
         return Err("n_threads must be at least 1".to_string());
@@ -804,8 +817,25 @@ pub fn multi_tilted_runs_with_writer(
 
     let current_score = obj_fn(graph, &partition);
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
+    let progress_bar = if show_progress {
+        let progress_bar = ProgressBar::with_draw_target(
+            Some(params.num_steps),
+            indicatif::ProgressDrawTarget::stdout_with_hz(1),
+        );
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:100.cyan/blue} {pos:>10}/{len} ({eta_precise})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        Some(progress_bar)
+    } else {
+        None
+    };
 
     let scoped_result = scope(|scope| -> Result<Partition, String> {
+        let progress_bar_ref = progress_bar.as_ref();
         let stats_send = if let Some(writer) = stats_writer {
             let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
                 unbounded();
@@ -861,6 +891,7 @@ pub fn multi_tilted_runs_with_writer(
             maximize,
             stats_send.as_ref(),
             score_send.as_ref(),
+            progress_bar_ref,
         );
 
         if let Some(send) = &stats_send {
@@ -872,6 +903,11 @@ pub fn multi_tilted_runs_with_writer(
         stop_tilted_workers(&job_sends);
         Ok(state.partition)
     });
+
+    if let Some(progress_bar) = progress_bar {
+        progress_bar.set_position(params.num_steps);
+        progress_bar.finish_and_clear();
+    }
 
     match scoped_result {
         Ok(inner) => inner,
@@ -891,7 +927,7 @@ pub fn multi_tilted_runs(
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
     accept_worse_prob: f64,
     maximize: bool,
-    _verbose: bool,
+    show_progress: bool,
 ) -> Result<Partition, String> {
     multi_tilted_runs_with_writer(
         graph,
@@ -903,5 +939,6 @@ pub fn multi_tilted_runs(
         maximize,
         None,
         None,
+        show_progress,
     )
 }

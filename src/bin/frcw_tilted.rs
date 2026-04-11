@@ -3,7 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::{value_parser, Arg, Command};
+use clap::{value_parser, Arg, ArgAction, Command};
 use frcw::config::parse_region_weights_config;
 use frcw::init::from_networkx;
 use frcw::objectives::{make_objective_fn, required_edge_cols, required_node_cols};
@@ -171,6 +171,12 @@ fn main() {
                 .help(
                     "Path to write per-step objective scores as CSV with step, score, and best_score.",
                 ),
+        )
+        .arg(
+            Arg::new("show-progress")
+                .long("show-progress")
+                .action(ArgAction::SetTrue)
+                .help("Whether to show a progress bar during execution."),
         );
 
     let matches = cli.get_matches();
@@ -196,6 +202,7 @@ fn main() {
         .get_one::<String>("writer")
         .expect("writer has a default value")
         .as_str();
+    let show_progress = matches.get_flag("show-progress");
 
     if tol < 0.0 || tol > 1.0 {
         panic!("Parameter error: '--tol' must be between 0 and 1.");
@@ -294,6 +301,7 @@ fn main() {
         "type": "tilted_run",
         "accept_worse_prob": accept_worse_prob,
         "maximize": maximize,
+        "show_progress": show_progress,
         "graph_json": graph_json,
     });
     if let Some(path) = matches.get_one::<String>("output-file") {
@@ -342,6 +350,7 @@ fn main() {
             .as_mut()
             .map(|writer| &mut **writer as &mut dyn StatsWriter),
         scores_writer.as_mut(),
+        show_progress,
     );
 
     match output {

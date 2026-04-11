@@ -334,6 +334,7 @@ fn test_tilted_stats_writer_records_accepted_steps() {
         true,
         Some(&mut stats_writer),
         None,
+        false,
     )
     .unwrap();
     assert_eq!(stats_writer.init_calls, 1);
@@ -374,6 +375,7 @@ fn test_tilted_scores_writer_records_every_step() {
         true,
         None,
         Some(&mut scores_writer),
+        false,
     )
     .unwrap();
     let scores = fs::read_to_string(&path).unwrap();
