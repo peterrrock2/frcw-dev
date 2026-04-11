@@ -97,7 +97,7 @@ mod ust {
         ///
         /// # Arguments
         /// * `graph` - The graph to form a spanning tree from. The maximum degree
-        ///   of the graph must be ≤256; otherwise, sampling from the uniform
+        ///   of the graph must be <=256; otherwise, sampling from the uniform
         ///   distribution is not guaranteed.
         /// * `buf` - The buffer to insert the spanning tree into.
         /// * `rng` - A random number generator (used to select the spanning tree

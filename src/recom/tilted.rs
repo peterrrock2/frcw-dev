@@ -9,8 +9,9 @@
 //! threads parallelize the tree-drawing step within a single sequential
 //! tilted chain. Workers draw trees, score proposals, and decide accept/reject;
 //! the main thread interleaves accepted proposals and rejections. Optional
-//! output writers run on separate threads fed by unbounded channels, so disk I/O
-//! and serialization do not block proposal generation.
+//! output writers run on separate threads fed by bounded channels, so disk I/O
+//! and serialization usually do not block proposal generation; the bound only
+//! engages if a writer falls persistently behind the chain.
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
 use super::{
@@ -25,7 +26,12 @@ use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
 use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+
+/// Capacity of the bounded channels that feed the stats and score writer
+/// threads. Large enough to absorb transient writer stalls; small enough to
+/// cap worst-case memory growth if a writer stays persistently behind.
+const WRITER_CHANNEL_CAPACITY: usize = 128;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -790,7 +796,7 @@ pub fn multi_tilted_runs_with_writer(
         let progress_bar_ref = progress_bar.as_ref();
         let stats_send = if let Some(writer) = stats_writer {
             let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
-                unbounded();
+                bounded(WRITER_CHANNEL_CAPACITY);
             scope.spawn({
                 let partition = partition.clone();
                 move |_| start_tilted_stats_writer(graph, partition, writer, recv)
@@ -801,7 +807,7 @@ pub fn multi_tilted_runs_with_writer(
         };
         let score_send = if let Some(writer) = score_writer {
             let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
-                unbounded();
+                bounded(WRITER_CHANNEL_CAPACITY);
             scope.spawn(move |_| {
                 start_tilted_score_writer(writer, current_score, Vec::new(), recv)
             });
@@ -1329,7 +1335,7 @@ where
         let progress_bar_ref = progress_bar.as_ref();
         let stats_send = if let Some(writer) = stats_writer {
             let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
-                unbounded();
+                bounded(WRITER_CHANNEL_CAPACITY);
             scope.spawn({
                 let partition = partition.clone();
                 move |_| start_tilted_stats_writer(graph, partition, writer, recv)
@@ -1340,7 +1346,7 @@ where
         };
         let score_send = if let Some(writer) = score_writer {
             let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
-                unbounded();
+                bounded(WRITER_CHANNEL_CAPACITY);
             scope.spawn(move |_| {
                 start_tilted_score_writer(writer, current_score, initial_district_scores, recv)
             });

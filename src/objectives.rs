@@ -29,7 +29,7 @@ pub enum Aggregation {
 const ONE_BELOW: f64 = f64::from_bits(1.0f64.to_bits() - 1);
 
 /// Synthetic node-attribute column name used when a `polsby_popper` config
-/// supplies `boundary_perim_col` but omits `perim_col` — the loader writes
+/// supplies `boundary_perim_col` but omits `perim_col` -- the loader writes
 /// the derived total-perimeter values here and the objective reads them back
 /// through the same key.
 const DERIVED_PERIM_COL: &str = "__frcw_derived_perim";

@@ -26,7 +26,7 @@ use rand::{Rng, SeedableRng};
 
 /// Determines how many proposals the stats thread can lag behind by
 /// (compared to the head of the chain).
-const STATS_CHANNEL_CAPACITY: usize = 8;
+const STATS_CHANNEL_CAPACITY: usize = 128;
 
 /// A unit of multithreaded work.
 struct JobPacket {

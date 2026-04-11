@@ -54,7 +54,7 @@ fn disconnected_districts(graph: &Graph, partition: &Partition) -> Vec<(usize, u
 /// * `assignment_col` - A column in the graph JSON corresponding to a
 ///    a seed partition. This column should be integer-valued and 1-indexed.
 /// * `columns` - Node metadata columns that must exist on every node. Missing
-///    keys panic — use this for columns a typo in whose name should be caught
+///    keys panic -- use this for columns a typo in whose name should be caught
 ///    at load time.
 /// * `partial_columns` - Node metadata columns that may be missing on some
 ///    nodes. Missing keys are stored as the string `"null"`, matching the
@@ -73,9 +73,9 @@ pub fn from_networkx(
 ) -> SerdeResult<(Graph, Partition)> {
     let (graph, data) =
         match graph_from_networkx(path, pop_col, columns, partial_columns, edge_float_cols) {
-        Ok(v) => v,
-        Err(e) => return Err(e),
-    };
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
 
     let raw_nodes = data["nodes"].as_array().expect("Could not get nodes array");
     let assignments: Vec<u32> = raw_nodes
@@ -377,7 +377,8 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
+        let (graph, _) =
+            graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -409,7 +410,8 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let (graph, _) = graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
+        let (graph, _) =
+            graph_from_networkx(&path_str, "population", vec![], vec![], vec![]).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(
@@ -441,7 +443,8 @@ mod tests {
         });
         let path = write_temp_graph(&json.to_string());
         let path_str = path.to_string_lossy();
-        let err = from_networkx(&path_str, "population", "district", vec![], vec![], vec![]).unwrap_err();
+        let err =
+            from_networkx(&path_str, "population", "district", vec![], vec![], vec![]).unwrap_err();
         fs::remove_file(path).unwrap();
 
         let msg = err.to_string();
