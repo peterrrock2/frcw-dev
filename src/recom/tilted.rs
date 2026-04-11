@@ -8,7 +8,9 @@
 //! Threading follows the same model as `multi_chain` in `run.rs`: worker
 //! threads parallelize the tree-drawing step within a single sequential
 //! tilted chain. Workers draw trees, score proposals, and decide accept/reject;
-//! the main thread interleaves accepted proposals and rejections.
+//! the main thread interleaves accepted proposals and rejections. Optional
+//! output writers run on separate threads fed by unbounded channels, so disk I/O
+//! and serialization do not block proposal generation.
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
 use super::{
@@ -50,6 +52,32 @@ struct ScoredProposal {
     proposal: RecomProposal,
     /// The objective score after applying `proposal`.
     score: f64,
+}
+
+/// A chain-statistics write packet sent from the chain thread to the writer thread.
+struct TiltedStatsPacket {
+    /// The accepted proposal step.
+    step: u64,
+    /// The accepted proposal, or `None` only for the termination sentinel.
+    proposal: Option<RecomProposal>,
+    /// Tilted rejection counts since the previous accepted proposal.
+    counts: SelfLoopCounts,
+    /// A sentinel used to stop the writer thread.
+    terminate: bool,
+}
+
+/// A score write packet sent from the chain thread to the score-writer thread.
+struct TiltedScorePacket {
+    /// First chain step represented by this packet.
+    first_step: u64,
+    /// Last chain step represented by this packet.
+    last_step: u64,
+    /// Objective score for each step in this packet.
+    score: f64,
+    /// Best score seen so far for each step in this packet.
+    best_score: f64,
+    /// A sentinel used to stop the writer thread.
+    terminate: bool,
 }
 
 /// Reusable worker-side buffers for one tilted worker.
@@ -125,46 +153,64 @@ impl TiltedMainState {
         }
     }
 
-    /// Writes the current score state if a score writer was provided.
+    /// Sends the current score state to the score-writer thread if one exists.
     ///
     /// # Arguments
     ///
-    /// * `score_writer` - Optional writer for per-step objective scores.
-    fn write_score(&self, score_writer: &mut Option<&mut ScoresWriter>) {
-        if let Some(writer) = score_writer.as_deref_mut() {
-            writer
-                .step(self.step, self.current_score, self.best_score)
-                .unwrap();
+    /// * `score_send` - Optional channel for per-step objective-score records.
+    fn send_score(&self, score_send: Option<&Sender<TiltedScorePacket>>) {
+        if let Some(send) = score_send {
+            send.send(TiltedScorePacket {
+                first_step: self.step,
+                last_step: self.step,
+                score: self.current_score,
+                best_score: self.best_score,
+                terminate: false,
+            })
+            .unwrap();
         }
     }
 
-    /// Records one tilted rejection self-loop.
+    /// Records tilted rejection self-loops.
     ///
     /// # Arguments
     ///
-    /// * `score_writer` - Optional writer for per-step objective scores.
-    fn record_rejection(&mut self, score_writer: &mut Option<&mut ScoresWriter>) {
-        self.step += 1;
-        self.pending_counts.inc(SelfLoopReason::TiltedRejection);
-        self.write_score(score_writer);
+    /// * `count` - Number of consecutive tilted rejections to record.
+    /// * `score_send` - Optional channel for per-step objective-score records.
+    fn record_rejections(&mut self, count: usize, score_send: Option<&Sender<TiltedScorePacket>>) {
+        if count == 0 {
+            return;
+        }
+        let first_step = self.step + 1;
+        self.step += count as u64;
+        self.pending_counts
+            .inc_by(SelfLoopReason::TiltedRejection, count);
+        if let Some(send) = score_send {
+            send.send(TiltedScorePacket {
+                first_step,
+                last_step: self.step,
+                score: self.current_score,
+                best_score: self.best_score,
+                terminate: false,
+            })
+            .unwrap();
+        }
     }
 
-    /// Applies an accepted proposal and writes chain statistics.
+    /// Applies an accepted proposal and sends output packets.
     ///
     /// # Arguments
     ///
-    /// * `graph` - Full graph associated with the chain.
     /// * `accepted` - Proposal selected by the main-thread interleaving step.
     /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-    /// * `stats_writer` - Optional writer for chain statistics.
-    /// * `score_writer` - Optional writer for per-step objective scores.
+    /// * `stats_send` - Optional channel for accepted proposal statistics.
+    /// * `score_send` - Optional channel for per-step objective-score records.
     fn apply_accepted_proposal(
         &mut self,
-        graph: &Graph,
         accepted: &ScoredProposal,
         maximize: bool,
-        stats_writer: &mut Option<&mut dyn StatsWriter>,
-        score_writer: &mut Option<&mut ScoresWriter>,
+        stats_send: Option<&Sender<TiltedStatsPacket>>,
+        score_send: Option<&Sender<TiltedScorePacket>>,
     ) {
         self.step += 1;
         self.partition.update(&accepted.proposal);
@@ -178,19 +224,17 @@ impl TiltedMainState {
         if is_new_best {
             self.best_score = accepted.score;
         }
-        if let Some(writer) = stats_writer.as_deref_mut() {
-            writer
-                .step(
-                    self.step,
-                    graph,
-                    &self.partition,
-                    &accepted.proposal,
-                    &self.pending_counts,
-                )
-                .unwrap();
+        if let Some(send) = stats_send {
+            send.send(TiltedStatsPacket {
+                step: self.step,
+                proposal: Some(accepted.proposal.clone()),
+                counts: self.pending_counts.clone(),
+                terminate: false,
+            })
+            .unwrap();
         }
         self.pending_counts = SelfLoopCounts::default();
-        self.write_score(score_writer);
+        self.send_score(score_send);
     }
 }
 
@@ -472,6 +516,56 @@ fn start_tilted_worker(
     }
 }
 
+/// Starts a chain-statistics writer thread.
+///
+/// # Arguments
+///
+/// * `graph` - Writer-owned graph clone.
+/// * `partition` - Writer-owned starting partition, updated from accepted proposals.
+/// * `writer` - Stats writer receiving accepted proposals and self-loop counts.
+/// * `recv` - Channel receiving asynchronous stats write packets.
+fn start_tilted_stats_writer(
+    graph: Graph,
+    mut partition: Partition,
+    writer: &mut dyn StatsWriter,
+    recv: Receiver<TiltedStatsPacket>,
+) {
+    writer.init(&graph, &partition).unwrap();
+    let mut next = recv.recv().unwrap();
+    while !next.terminate {
+        let proposal = next.proposal.unwrap();
+        partition.update(&proposal);
+        writer
+            .step(next.step, &graph, &partition, &proposal, &next.counts)
+            .unwrap();
+        next = recv.recv().unwrap();
+    }
+    writer.close().unwrap();
+}
+
+/// Starts a score writer thread.
+///
+/// # Arguments
+///
+/// * `writer` - Score writer receiving per-step objective scores.
+/// * `initial_score` - Objective score of the starting partition.
+/// * `recv` - Channel receiving asynchronous score write packets.
+fn start_tilted_score_writer(
+    writer: &mut ScoresWriter,
+    initial_score: f64,
+    recv: Receiver<TiltedScorePacket>,
+) {
+    writer.init(initial_score).unwrap();
+    let mut next = recv.recv().unwrap();
+    while !next.terminate {
+        for step in next.first_step..=next.last_step {
+            writer.step(step, next.score, next.best_score).unwrap();
+        }
+        next = recv.recv().unwrap();
+    }
+    writer.close().unwrap();
+}
+
 /// Sends the next canonical chain state to every worker.
 ///
 /// # Arguments
@@ -510,6 +604,37 @@ fn stop_tilted_workers(job_sends: &[Sender<TiltedJobPacket>]) {
     }
 }
 
+/// Stops the chain-statistics writer thread.
+///
+/// # Arguments
+///
+/// * `send` - Channel sending stats packets to the writer thread.
+fn stop_tilted_stats_writer(send: &Sender<TiltedStatsPacket>) {
+    send.send(TiltedStatsPacket {
+        step: 0,
+        proposal: None,
+        counts: SelfLoopCounts::default(),
+        terminate: true,
+    })
+    .unwrap();
+}
+
+/// Stops the score writer thread.
+///
+/// # Arguments
+///
+/// * `send` - Channel sending score packets to the writer thread.
+fn stop_tilted_score_writer(send: &Sender<TiltedScorePacket>) {
+    send.send(TiltedScorePacket {
+        first_step: 0,
+        last_step: 0,
+        score: 0.0,
+        best_score: 0.0,
+        terminate: true,
+    })
+    .unwrap();
+}
+
 /// Blocks until each worker has returned exactly one round of tilted output.
 ///
 /// # Arguments
@@ -540,38 +665,33 @@ fn collect_tilted_results(
 /// Interleaves one batch of worker rejections/proposals into the sequential chain.
 ///
 /// Rejections increment the chain step without changing state. Accepted proposals
-/// are applied and written through `stats_writer`. Every interleaved event is
-/// written through `score_writer`.
+/// and score events are sent to asynchronous writer threads.
 ///
 /// # Arguments
 ///
 /// * `state` - Main-thread canonical chain state.
 /// * `loops` - Number of worker tilted rejections to interleave as self-loops.
 /// * `proposals` - Worker-accepted proposals to interleave with self-loops.
-/// * `graph` - Full graph associated with the chain.
 /// * `params` - ReCom parameters containing the target step count.
 /// * `rng` - Main-thread RNG used for event interleaving and proposal selection.
 /// * `job_sends` - Worker job channels for broadcasting state updates.
 /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
-/// * `score_writer` - Optional writer for per-step objective scores.
+/// * `stats_send` - Optional channel for accepted proposal statistics.
+/// * `score_send` - Optional channel for per-step objective-score records.
 fn interleave_tilted_round(
     state: &mut TiltedMainState,
     mut loops: usize,
     mut proposals: Vec<ScoredProposal>,
-    graph: &Graph,
     params: &RecomParams,
     rng: &mut SmallRng,
     job_sends: &[Sender<TiltedJobPacket>],
     maximize: bool,
-    stats_writer: &mut Option<&mut dyn StatsWriter>,
-    score_writer: &mut Option<&mut ScoresWriter>,
+    stats_send: Option<&Sender<TiltedStatsPacket>>,
+    score_send: Option<&Sender<TiltedScorePacket>>,
 ) {
     if proposals.is_empty() {
         let remaining = (params.num_steps - state.step) as usize;
-        for _ in 0..loops.min(remaining) {
-            state.record_rejection(score_writer);
-        }
+        state.record_rejections(loops.min(remaining), score_send);
         send_tilted_jobs(job_sends, None, state.current_score);
         return;
     }
@@ -581,14 +701,14 @@ fn interleave_tilted_round(
     while total > 0 && state.step < params.num_steps {
         let event = rng.random_range(0..total);
         if event < loops {
-            state.record_rejection(score_writer);
+            state.record_rejections(1, score_send);
             loops -= 1;
             total -= 1;
             continue;
         }
 
         let accepted = &proposals[rng.random_range(0..proposals.len())];
-        state.apply_accepted_proposal(graph, accepted, maximize, stats_writer, score_writer);
+        state.apply_accepted_proposal(accepted, maximize, stats_send, score_send);
         send_tilted_jobs(job_sends, Some(&accepted.proposal), state.current_score);
         break; // need new round (state changed)
     }
@@ -599,34 +719,25 @@ fn interleave_tilted_round(
 /// # Arguments
 ///
 /// * `state` - Main-thread canonical chain state.
-/// * `graph` - Full graph associated with the chain.
 /// * `params` - ReCom parameters containing the target step count.
 /// * `n_threads` - Number of worker packets to collect per round.
 /// * `result_recv` - Shared result channel from all workers.
 /// * `job_sends` - Worker job channels.
 /// * `rng` - Main-thread RNG used for interleaving.
 /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
-/// * `score_writer` - Optional writer for per-step objective scores.
+/// * `stats_send` - Optional channel for accepted proposal statistics.
+/// * `score_send` - Optional channel for per-step objective-score records.
 fn run_tilted_main_loop(
     state: &mut TiltedMainState,
-    graph: &Graph,
     params: &RecomParams,
     n_threads: usize,
     result_recv: &Receiver<TiltedResultPacket>,
     job_sends: &[Sender<TiltedJobPacket>],
     rng: &mut SmallRng,
     maximize: bool,
-    mut stats_writer: Option<&mut dyn StatsWriter>,
-    mut score_writer: Option<&mut ScoresWriter>,
+    stats_send: Option<&Sender<TiltedStatsPacket>>,
+    score_send: Option<&Sender<TiltedScorePacket>>,
 ) {
-    if let Some(writer) = stats_writer.as_deref_mut() {
-        writer.init(graph, &state.partition).unwrap();
-    }
-    if let Some(writer) = score_writer.as_deref_mut() {
-        writer.init(state.current_score).unwrap();
-    }
-
     if params.num_steps > 0 {
         send_tilted_jobs(job_sends, None, state.current_score);
     }
@@ -634,24 +745,8 @@ fn run_tilted_main_loop(
     while state.step < params.num_steps {
         let (loops, proposals) = collect_tilted_results(result_recv, n_threads);
         interleave_tilted_round(
-            state,
-            loops,
-            proposals,
-            graph,
-            params,
-            rng,
-            job_sends,
-            maximize,
-            &mut stats_writer,
-            &mut score_writer,
+            state, loops, proposals, params, rng, job_sends, maximize, stats_send, score_send,
         );
-    }
-
-    if let Some(writer) = stats_writer.as_deref_mut() {
-        writer.close().unwrap();
-    }
-    if let Some(writer) = score_writer.as_deref_mut() {
-        writer.close().unwrap();
     }
 }
 
@@ -672,8 +767,9 @@ fn run_tilted_main_loop(
 /// * `obj_fn` - The objective function.
 /// * `accept_worse_prob` - Probability of accepting a proposal with a worse score.
 /// * `maximize` - If true, higher scores are better. If false, lower scores are better.
-/// * `stats_writer` - Optional writer for accepted chain proposals and self-loop counts.
-/// * `score_writer` - Optional writer for per-step objective scores.
+/// * `stats_writer` - Optional asynchronous writer for accepted chain proposals
+///   and self-loop counts.
+/// * `score_writer` - Optional asynchronous writer for per-step objective scores.
 ///
 /// # Returns
 ///
@@ -710,6 +806,27 @@ pub fn multi_tilted_runs_with_writer(
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
 
     let scoped_result = scope(|scope| -> Result<Partition, String> {
+        let stats_send = if let Some(writer) = stats_writer {
+            let (send, recv): (Sender<TiltedStatsPacket>, Receiver<TiltedStatsPacket>) =
+                unbounded();
+            scope.spawn({
+                let graph = graph.clone();
+                let partition = partition.clone();
+                move |_| start_tilted_stats_writer(graph, partition, writer, recv)
+            });
+            Some(send)
+        } else {
+            None
+        };
+        let score_send = if let Some(writer) = score_writer {
+            let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
+                unbounded();
+            scope.spawn(move |_| start_tilted_score_writer(writer, current_score, recv));
+            Some(send)
+        } else {
+            None
+        };
+
         // Start worker threads.
         for t_idx in 0..n_threads {
             let rng_seed = params.rng_seed + t_idx as u64 + 1;
@@ -736,17 +853,22 @@ pub fn multi_tilted_runs_with_writer(
         let mut state = TiltedMainState::new(partition, current_score);
         run_tilted_main_loop(
             &mut state,
-            graph,
             params,
             n_threads,
             &result_recv,
             &job_sends,
             &mut rng,
             maximize,
-            stats_writer,
-            score_writer,
+            stats_send.as_ref(),
+            score_send.as_ref(),
         );
 
+        if let Some(send) = &stats_send {
+            stop_tilted_stats_writer(send);
+        }
+        if let Some(send) = &score_send {
+            stop_tilted_score_writer(send);
+        }
         stop_tilted_workers(&job_sends);
         Ok(state.partition)
     });

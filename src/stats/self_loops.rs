@@ -51,6 +51,11 @@ impl SelfLoopCounts {
         *self.counts.entry(reason).or_insert(0) += 1;
     }
 
+    /// Increments the self-loop count by `count` (with a reason).
+    pub fn inc_by(&mut self, reason: SelfLoopReason, count: usize) {
+        *self.counts.entry(reason).or_insert(0) += count;
+    }
+
     /// Decrements the self-loop count (with a reason).
     pub fn dec(&mut self, reason: SelfLoopReason) {
         *self.counts.entry(reason).or_insert(0) -= 1;
