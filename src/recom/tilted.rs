@@ -16,7 +16,9 @@
 use super::{
     node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant,
 };
-use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
+use crate::buffers::{
+    graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
+};
 use crate::graph::Graph;
 use crate::objectives::IncrementalObjective;
 use crate::partition::Partition;
@@ -94,6 +96,8 @@ struct TiltedWorkerBuffers {
     proposal: RecomProposal,
     /// Restores the worker partition after temporary scoring.
     revert: RecomProposal,
+    /// Scratch buffers for connectivity checks.
+    connectivity: ConnectivityBuffers,
 }
 
 impl TiltedWorkerBuffers {
@@ -115,6 +119,7 @@ impl TiltedWorkerBuffers {
             split: SplitBuffer::new(buf_size, balance_ub as usize),
             proposal: RecomProposal::new_buffer(buf_size),
             revert: RecomProposal::new_buffer(buf_size),
+            connectivity: ConnectivityBuffers::new(buf_size),
         }
     }
 }
@@ -252,106 +257,24 @@ impl TiltedMainState {
     }
 }
 
-/// Returns true iff `graph` has exactly one connected component.
-///
-/// # Arguments
-///
-/// * `graph` - Graph to test for connectivity.
-///
-/// # Returns
-///
-/// `true` if every node in `graph` is reachable from node 0; otherwise `false`.
-fn graph_connected(graph: &Graph) -> bool {
-    let n = graph.pops.len();
-    if n <= 1 {
-        return true;
-    }
-    let mut visited = vec![false; n];
-    let mut stack = Vec::<usize>::with_capacity(n);
-    visited[0] = true;
-    stack.push(0);
-    let mut seen = 1;
-    while let Some(node) = stack.pop() {
-        for &neighbor in graph.neighbors[node].iter() {
-            if !visited[neighbor] {
-                visited[neighbor] = true;
-                seen += 1;
-                stack.push(neighbor);
-            }
-        }
-    }
-    seen == n
-}
-
-/// Scratch buffers for repeated connectivity checks.
-struct ConnectivityBuffers {
-    visited: Vec<bool>,
-    stack: Vec<usize>,
-}
-
-impl ConnectivityBuffers {
-    fn new(capacity: usize) -> Self {
-        Self {
-            visited: Vec::with_capacity(capacity),
-            stack: Vec::with_capacity(capacity),
-        }
-    }
-}
-
-/// Variant of [`graph_connected`] that reuses caller-owned scratch buffers.
-fn graph_connected_buffered(graph: &Graph, bufs: &mut ConnectivityBuffers) -> bool {
-    let n = graph.pops.len();
-    if n <= 1 {
-        return true;
-    }
-    bufs.visited.clear();
-    bufs.visited.resize(n, false);
-    bufs.stack.clear();
-    bufs.visited[0] = true;
-    bufs.stack.push(0);
-    let mut seen = 1;
-    while let Some(node) = bufs.stack.pop() {
-        for &neighbor in graph.neighbors[node].iter() {
-            if !bufs.visited[neighbor] {
-                bufs.visited[neighbor] = true;
-                seen += 1;
-                bufs.stack.push(neighbor);
-            }
-        }
-    }
-    seen == n
-}
-
-/// Builds the spanning-tree sampler and optional region columns for the supported variants.
+/// Builds the spanning-tree sampler for the supported variants.
 ///
 /// # Arguments
 ///
 /// * `params` - ReCom parameters containing the variant and optional region weights.
 /// * `buf_size` - Capacity used by the sampler's internal buffers.
-///
-/// # Returns
-///
-/// A boxed spanning-tree sampler and, for region-aware ReCom, the ordered region
-/// attribute names to copy into each pair subgraph.
 fn make_tilted_sampler(
     params: &RecomParams,
     buf_size: usize,
-) -> (Box<dyn SpanningTreeSampler>, Option<Vec<String>>) {
+) -> Box<dyn SpanningTreeSampler> {
     if params.variant == RecomVariant::DistrictPairsRegionAware {
         let region_weights = params
             .region_weights
             .clone()
             .expect("Region weights required for region-aware ReCom.");
-        let region_attrs = region_weights
-            .iter()
-            .map(|(col, _)| col.to_owned())
-            .collect();
-        (
-            Box::new(RegionAwareSampler::new(buf_size, region_weights)),
-            Some(region_attrs),
-        )
+        Box::new(RegionAwareSampler::new(buf_size, region_weights))
     } else if params.variant == RecomVariant::DistrictPairsRMST {
-        (Box::new(RMSTSampler::new(buf_size)), None)
+        Box::new(RMSTSampler::new(buf_size))
     } else {
         panic!("ReCom variant not supported by tilted run optimizer.");
     }
@@ -364,28 +287,16 @@ fn make_tilted_sampler(
 /// * `graph` - Full graph associated with `partition`.
 /// * `partition` - Worker-local partition state.
 /// * `buffers` - Worker buffers whose subgraph field is overwritten.
-/// * `region_aware_attrs` - Optional node-attribute columns needed by region-aware sampling.
 /// * `dist_a` - First selected district label.
 /// * `dist_b` - Second selected district label.
 fn fill_pair_subgraph(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffers,
-    region_aware_attrs: Option<&Vec<String>>,
     dist_a: usize,
     dist_b: usize,
 ) {
-    if let Some(attrs) = region_aware_attrs {
-        partition.subgraph_with_attr_subset(
-            graph,
-            &mut buffers.subgraph,
-            attrs.iter(),
-            dist_a,
-            dist_b,
-        );
-    } else {
-        partition.subgraph_with_attr(graph, &mut buffers.subgraph, dist_a, dist_b);
-    }
+    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 }
 
 /// Stores the current state of the two affected districts before scoring a proposal.
@@ -440,7 +351,6 @@ fn draw_tilted_result(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffers,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
-    region_aware_attrs: Option<&Vec<String>>,
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
     current_score: f64,
     accept_worse_prob: f64,
@@ -452,20 +362,19 @@ fn draw_tilted_result(
             continue; // retry (non-reversible)
         };
 
-        fill_pair_subgraph(
-            graph,
-            partition,
-            buffers,
-            region_aware_attrs,
-            dist_a,
-            dist_b,
-        );
+        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
 
-        if !graph_connected(&buffers.subgraph.graph) {
+        if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue; // retry (non-reversible)
         }
 
-        st_sampler.random_spanning_tree(&buffers.subgraph.graph, &mut buffers.spanning_tree, rng);
+        st_sampler.random_spanning_tree_with_parent(
+            &buffers.subgraph.graph,
+            graph,
+            &buffers.subgraph.raw_nodes,
+            &mut buffers.spanning_tree,
+            rng,
+        );
         let split = random_split(
             &buffers.subgraph.graph,
             rng,
@@ -528,7 +437,7 @@ fn draw_tilted_result(
 /// * `job_recv` - Channel receiving canonical-state updates from the main thread.
 /// * `result_send` - Channel sending worker accept/reject results to the main thread.
 fn start_tilted_worker(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     params: RecomParams,
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
@@ -542,7 +451,7 @@ fn start_tilted_worker(
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
-    let (mut st_sampler, region_aware_attrs) = make_tilted_sampler(&params, buf_size);
+    let mut st_sampler = make_tilted_sampler(&params, buf_size);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -551,12 +460,11 @@ fn start_tilted_worker(
         }
 
         let result = draw_tilted_result(
-            &graph,
+            graph,
             &mut partition,
             &params,
             &mut buffers,
             &mut st_sampler,
-            region_aware_attrs.as_ref(),
             obj_fn,
             next.current_score,
             accept_worse_prob,
@@ -891,7 +799,7 @@ pub fn multi_tilted_runs_with_writer(
 
             scope.spawn(move |_| {
                 start_tilted_worker(
-                    graph.clone(),
+                    graph,
                     partition,
                     params.clone(),
                     obj_fn,
@@ -1153,7 +1061,7 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
-    let (mut st_sampler, _region_aware_attrs) = make_tilted_sampler(&params, buf_size);
+    let mut st_sampler = make_tilted_sampler(&params, buf_size);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {

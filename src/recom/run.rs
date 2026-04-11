@@ -11,7 +11,9 @@ use super::{
     cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
     RecomVariant,
 };
-use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
+use crate::buffers::{
+    graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
+};
 use crate::graph::Graph;
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
@@ -25,29 +27,6 @@ use rand::{Rng, SeedableRng};
 /// Determines how many proposals the stats thread can lag behind by
 /// (compared to the head of the chain).
 const STATS_CHANNEL_CAPACITY: usize = 8;
-
-/// Returns true iff `graph` has exactly one connected component.
-fn graph_connected(graph: &Graph) -> bool {
-    let n = graph.pops.len();
-    if n <= 1 {
-        return true;
-    }
-    let mut visited = vec![false; n];
-    let mut stack = Vec::<usize>::with_capacity(n);
-    visited[0] = true;
-    stack.push(0);
-    let mut seen = 1;
-    while let Some(node) = stack.pop() {
-        for &neighbor in graph.neighbors[node].iter() {
-            if !visited[neighbor] {
-                visited[neighbor] = true;
-                seen += 1;
-                stack.push(neighbor);
-            }
-        }
-    }
-    seen == n
-}
 
 /// A unit of multithreaded work.
 struct JobPacket {
@@ -83,18 +62,18 @@ struct StepPacket {
 
 /// Starts a thread that writes statistics from accepted plans to `stdout`.
 fn start_stats_thread(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     mut writer: Box<dyn StatsWriter>,
     recv: Receiver<StepPacket>,
 ) {
-    writer.init(&graph, &partition).unwrap();
+    writer.init(graph, &partition).unwrap();
     let mut next: StepPacket = recv.recv().unwrap();
     while !next.terminate {
         let proposal = next.proposal.unwrap();
         partition.update(&proposal);
         writer
-            .step(next.step, &graph, &partition, &proposal, &next.counts)
+            .step(next.step, graph, &partition, &proposal, &next.counts)
             .unwrap();
         next = recv.recv().unwrap();
     }
@@ -126,7 +105,7 @@ fn stop_stats_thread(send: &Sender<StepPacket>) {
 /// * `job_recv` - A Crossbeam channel for receiving batches of work from the main thread.
 /// * `result_send` - A Crossbeam channel for sending completed batches to the main thread.
 fn start_job_thread(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     params: RecomParams,
     rng_seed: u64,
@@ -140,6 +119,7 @@ fn start_job_thread(
     let mut st_buf = SpanningTreeBuffer::new(buf_size);
     let mut split_buf = SplitBuffer::new(buf_size, params.balance_ub as usize);
     let mut proposal_buf = RecomProposal::new_buffer(buf_size);
+    let mut connectivity_buf = ConnectivityBuffers::new(buf_size);
     let mut st_sampler: Box<dyn SpanningTreeSampler>;
 
     let reversible = params.variant == RecomVariant::Reversible;
@@ -229,7 +209,7 @@ fn start_job_thread(
 
                 // A disconnected merged district pair has no spanning tree.
                 // Treat this as a rejection instead of panicking in the sampler.
-                if !graph_connected(&subgraph_buf.graph) {
+                if !graph_connected_buffered(&subgraph_buf.graph, &mut connectivity_buf) {
                     if reversible {
                         counts.inc(SelfLoopReason::NoSplit);
                         break; // success
@@ -392,8 +372,11 @@ pub fn multi_chain(
         let pb_ref = &pb;
 
         // Start stats thread.
-        scope.spawn(move |_| {
-            start_stats_thread(graph.clone(), partition.clone(), writer, stats_recv);
+        scope.spawn({
+            let partition = partition.clone();
+            move |_| {
+                start_stats_thread(graph, partition, writer, stats_recv);
+            }
         });
 
         // Start job threads.
@@ -403,10 +386,11 @@ pub fn multi_chain(
             let job_recv = job_recvs[t_idx].clone();
             let result_send = result_send.clone();
 
+            let worker_partition = partition.clone();
             scope.spawn(move |_| {
                 start_job_thread(
-                    graph.clone(),
-                    partition.clone(),
+                    graph,
+                    worker_partition,
                     params.clone(),
                     rng_seed,
                     node_ub,

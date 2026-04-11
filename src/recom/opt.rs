@@ -7,7 +7,9 @@
 use super::{
     node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant,
 };
-use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
+use crate::buffers::{
+    graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
+};
 use crate::graph::Graph;
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
@@ -18,29 +20,6 @@ use rand::SeedableRng;
 use serde_json::json;
 use std::collections::HashMap;
 pub type ScoreValue = f64;
-
-/// Returns true iff `graph` has exactly one connected component.
-fn graph_connected(graph: &Graph) -> bool {
-    let n = graph.pops.len();
-    if n <= 1 {
-        return true;
-    }
-    let mut visited = vec![false; n];
-    let mut stack = Vec::<usize>::with_capacity(n);
-    visited[0] = true;
-    stack.push(0);
-    let mut seen = 1;
-    while let Some(node) = stack.pop() {
-        for &neighbor in graph.neighbors[node].iter() {
-            if !visited[neighbor] {
-                visited[neighbor] = true;
-                seen += 1;
-                stack.push(neighbor);
-            }
-        }
-    }
-    seen == n
-}
 
 /// A unit of multithreaded work.
 struct OptJobPacket {
@@ -77,7 +56,7 @@ struct OptResultPacket {
 /// * `job_recv` - A Crossbeam channel for receiving batches of work from the main thread.
 /// * `result_send` - A Crossbeam channel for sending completed batches to the main thread.
 fn start_opt_thread(
-    graph: Graph,
+    graph: &Graph,
     mut partition: Partition,
     params: RecomParams,
     obj_fn: impl Fn(&Graph, &Partition) -> ScoreValue + Send + Clone + Copy,
@@ -97,6 +76,7 @@ fn start_opt_thread(
     let mut st_buf = SpanningTreeBuffer::new(buf_size);
     let mut split_buf = SplitBuffer::new(buf_size, params.balance_ub as usize);
     let mut proposal_buf = RecomProposal::new_buffer(buf_size);
+    let mut connectivity_buf = ConnectivityBuffers::new(buf_size);
     let mut st_sampler: Box<dyn SpanningTreeSampler>;
     if params.variant == RecomVariant::DistrictPairsRegionAware {
         st_sampler = Box::new(RegionAwareSampler::new(
@@ -116,21 +96,27 @@ fn start_opt_thread(
         }
 
         let mut best_partition: Option<Partition> = None;
-        let mut score = obj_fn(&graph, &partition);
+        let mut score = obj_fn(graph, &partition);
         let mut best_score: ScoreValue = score;
         let mut step = 0;
         while step < next.n_steps {
             // Sample a ReCom step.
-            let dist_pair = uniform_dist_pair(&graph, &mut partition, &mut rng);
+            let dist_pair = uniform_dist_pair(graph, &mut partition, &mut rng);
             if dist_pair.is_none() {
                 continue;
             }
             let (dist_a, dist_b) = dist_pair.unwrap();
-            partition.subgraph_with_attr(&graph, &mut subgraph_buf, dist_a, dist_b);
-            if !graph_connected(&subgraph_buf.graph) {
+            partition.subgraph(graph, &mut subgraph_buf, dist_a, dist_b);
+            if !graph_connected_buffered(&subgraph_buf.graph, &mut connectivity_buf) {
                 continue;
             }
-            st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
+            st_sampler.random_spanning_tree_with_parent(
+                &subgraph_buf.graph,
+                graph,
+                &subgraph_buf.raw_nodes,
+                &mut st_buf,
+                &mut rng,
+            );
             let split = random_split(
                 &subgraph_buf.graph,
                 &mut rng,
@@ -143,7 +129,7 @@ fn start_opt_thread(
                 &params,
             );
             if split.is_ok() {
-                score = obj_fn(&graph, &partition);
+                score = obj_fn(graph, &partition);
                 partition.update(&proposal_buf);
                 if score >= best_score {
                     // TODO: reduce allocations by keeping a separate
@@ -156,7 +142,7 @@ fn start_opt_thread(
         }
         let result = match best_partition {
             Some(partition) => OptResultPacket {
-                best_partition: Some(partition.clone()),
+                best_partition: Some(partition),
                 best_score: Some(best_score),
             },
             None => OptResultPacket {
@@ -220,7 +206,7 @@ pub fn multi_short_bursts(
     // All optimization threads send a summary of chain results back to the main thread.
     let (result_send, result_recv): (Sender<OptResultPacket>, Receiver<OptResultPacket>) =
         unbounded();
-    let mut score = obj_fn(&graph, &partition);
+    let mut score = obj_fn(graph, &partition);
 
     let scoped_result = scope(|scope| -> Result<Partition, String> {
         // Start optimization threads.
@@ -229,12 +215,12 @@ pub fn multi_short_bursts(
             let rng_seed = params.rng_seed + t_idx as u64 + 1;
             let job_recv = job_recvs[t_idx].clone();
             let result_send = result_send.clone();
-            let partition = partition.clone();
+            let worker_partition = partition.clone();
 
             scope.spawn(move |_| {
                 start_opt_thread(
-                    graph.clone(),
-                    partition,
+                    graph,
+                    worker_partition,
                     params.clone(),
                     obj_fn,
                     rng_seed,
