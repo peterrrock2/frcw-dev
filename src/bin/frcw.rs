@@ -17,12 +17,17 @@ use sha3::{Digest, Sha3_256};
 use std::path::PathBuf;
 use std::{fs, io};
 
+const OUTPUT_BUFFER_CAPACITY: usize = 128 * 1024;
+
 fn output_buffer(path: &str, overwrite_output: bool) -> Box<dyn io::Write + Send> {
     let path = std::path::Path::new(path);
     if path.exists() && !overwrite_output {
         panic!("Output file already exists. Use --overwrite-output to replace it.");
     };
-    Box::new(io::BufWriter::new(fs::File::create(path).unwrap()))
+    Box::new(io::BufWriter::with_capacity(
+        OUTPUT_BUFFER_CAPACITY,
+        fs::File::create(path).unwrap(),
+    ))
 }
 
 fn main() {
@@ -275,7 +280,10 @@ fn main() {
 
     let output_buffer: Box<dyn io::Write + Send> = match matches.get_one::<String>("output-file") {
         Some(path) => output_buffer(path, overwrite_output),
-        None => Box::new(io::BufWriter::new(std::io::stdout())),
+        None => Box::new(io::BufWriter::with_capacity(
+            OUTPUT_BUFFER_CAPACITY,
+            std::io::stdout(),
+        )),
     };
 
     let writer: Box<dyn StatsWriter> = match writer_str {

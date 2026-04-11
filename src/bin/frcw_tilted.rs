@@ -27,10 +27,15 @@ fn assert_can_write_output(path: &Path, overwrite_output: bool) {
     };
 }
 
+const OUTPUT_BUFFER_CAPACITY: usize = 128 * 1024;
+
 fn output_buffer(path: &str, overwrite_output: bool) -> Box<dyn io::Write + Send> {
     let path = std::path::Path::new(path);
     assert_can_write_output(path, overwrite_output);
-    Box::new(io::BufWriter::new(fs::File::create(path).unwrap()))
+    Box::new(io::BufWriter::with_capacity(
+        OUTPUT_BUFFER_CAPACITY,
+        fs::File::create(path).unwrap(),
+    ))
 }
 
 fn metadata_path(output_path: &str) -> PathBuf {
