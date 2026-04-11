@@ -11,7 +11,9 @@
 //! the main thread interleaves accepted proposals and rejections.
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
-use super::{node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant};
+use super::{
+    node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant,
+};
 use crate::buffers::{SpanningTreeBuffer, SplitBuffer, SubgraphBuffer};
 use crate::graph::Graph;
 use crate::partition::Partition;
@@ -37,12 +39,133 @@ struct TiltedJobPacket {
 struct TiltedResultPacket {
     /// Number of tilted-criterion rejections (self-loops).
     rejections: u64,
-    /// Accepted proposals: `(random_id, proposal, score)`.
-    /// The random ID is used for deterministic interleaving (same technique as `run.rs`).
-    proposals: Vec<(u64, RecomProposal, f64)>,
+    /// Accepted proposals from this round.
+    proposals: Vec<ScoredProposal>,
+}
+
+/// A proposal accepted by a worker, plus the score it would produce.
+struct ScoredProposal {
+    /// Random ID used for deterministic interleaving (same technique as `run.rs`).
+    id: u64,
+    /// The proposal accepted by a worker.
+    proposal: RecomProposal,
+    /// The objective score after applying `proposal`.
+    score: f64,
+}
+
+/// Reusable worker-side buffers for one tilted worker.
+struct TiltedWorkerBuffers {
+    /// Merged two-district subgraph buffer.
+    subgraph: SubgraphBuffer,
+    /// Spanning tree storage for the merged subgraph.
+    spanning_tree: SpanningTreeBuffer,
+    /// Random split workspace.
+    split: SplitBuffer,
+    /// Candidate proposal storage.
+    proposal: RecomProposal,
+    /// Restores the worker partition after temporary scoring.
+    revert: RecomProposal,
+}
+
+impl TiltedWorkerBuffers {
+    /// Creates the reusable worker-side buffers.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph_nodes` - Number of nodes in the full graph.
+    /// * `buf_size` - Capacity for two-district subgraph/proposal buffers.
+    /// * `balance_ub` - Soft upper bound used by reversible split buffers.
+    ///
+    /// # Returns
+    ///
+    /// A `TiltedWorkerBuffers` value with all reusable worker buffers allocated.
+    fn new(graph_nodes: usize, buf_size: usize, balance_ub: u32) -> TiltedWorkerBuffers {
+        TiltedWorkerBuffers {
+            subgraph: SubgraphBuffer::new(graph_nodes, buf_size),
+            spanning_tree: SpanningTreeBuffer::new(buf_size),
+            split: SplitBuffer::new(buf_size, balance_ub as usize),
+            proposal: RecomProposal::new_buffer(buf_size),
+            revert: RecomProposal::new_buffer(buf_size),
+        }
+    }
+}
+
+/// Main-thread state for the single sequential tilted chain.
+struct TiltedMainState {
+    /// Total chain steps processed, including accepted proposals and self-loops.
+    step: u64,
+    /// Canonical chain state.
+    partition: Partition,
+    /// Objective score of `partition`.
+    current_score: f64,
+    /// Best score seen so far, used only for verbose progress output.
+    best_score: f64,
+    /// Best partition seen so far, used only for verbose progress output.
+    best_partition: Partition,
+}
+
+impl TiltedMainState {
+    /// Creates main-thread chain state from the initial partition and score.
+    ///
+    /// # Arguments
+    ///
+    /// * `partition` - Initial canonical chain state.
+    /// * `current_score` - Objective score of `partition`.
+    ///
+    /// # Returns
+    ///
+    /// A `TiltedMainState` initialized at step 0 with the starting plan as the
+    /// best-seen plan.
+    fn new(partition: Partition, current_score: f64) -> TiltedMainState {
+        TiltedMainState {
+            step: 0,
+            best_score: current_score,
+            best_partition: partition.clone(),
+            partition,
+            current_score,
+        }
+    }
+
+    /// Applies an accepted proposal and updates best-seen progress state.
+    ///
+    /// # Arguments
+    ///
+    /// * `accepted` - Proposal selected by the main-thread interleaving step.
+    /// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
+    /// * `verbose` - If true, print a JSONL record when this proposal is a new best.
+    fn apply_accepted_proposal(
+        &mut self,
+        accepted: &ScoredProposal,
+        maximize: bool,
+        verbose: bool,
+    ) {
+        self.partition.update(&accepted.proposal);
+        self.current_score = accepted.score;
+
+        let is_new_best = if maximize {
+            accepted.score > self.best_score
+        } else {
+            accepted.score < self.best_score
+        };
+        if is_new_best {
+            self.best_score = accepted.score;
+            self.best_partition = self.partition.clone();
+            if verbose {
+                print_best_improvement(self.step, self.best_score, &self.best_partition);
+            }
+        }
+    }
 }
 
 /// Returns true iff `graph` has exactly one connected component.
+///
+/// # Arguments
+///
+/// * `graph` - Graph to test for connectivity.
+///
+/// # Returns
+///
+/// `true` if every node in `graph` is reachable from node 0; otherwise `false`.
 fn graph_connected(graph: &Graph) -> bool {
     let n = graph.pops.len();
     if n <= 1 {
@@ -65,11 +188,211 @@ fn graph_connected(graph: &Graph) -> bool {
     seen == n
 }
 
+/// Builds the spanning-tree sampler and optional region columns for the supported variants.
+///
+/// # Arguments
+///
+/// * `params` - ReCom parameters containing the variant and optional region weights.
+/// * `buf_size` - Capacity used by the sampler's internal buffers.
+///
+/// # Returns
+///
+/// A boxed spanning-tree sampler and, for region-aware ReCom, the ordered region
+/// attribute names to copy into each pair subgraph.
+fn make_tilted_sampler(
+    params: &RecomParams,
+    buf_size: usize,
+) -> (Box<dyn SpanningTreeSampler>, Option<Vec<String>>) {
+    if params.variant == RecomVariant::DistrictPairsRegionAware {
+        let region_weights = params
+            .region_weights
+            .clone()
+            .expect("Region weights required for region-aware ReCom.");
+        let region_attrs = region_weights
+            .iter()
+            .map(|(col, _)| col.to_owned())
+            .collect();
+        (
+            Box::new(RegionAwareSampler::new(buf_size, region_weights)),
+            Some(region_attrs),
+        )
+    } else if params.variant == RecomVariant::DistrictPairsRMST {
+        (Box::new(RMSTSampler::new(buf_size)), None)
+    } else {
+        panic!("ReCom variant not supported by tilted run optimizer.");
+    }
+}
+
+/// Copies the selected district pair into the reusable subgraph buffer.
+///
+/// # Arguments
+///
+/// * `graph` - Full graph associated with `partition`.
+/// * `partition` - Worker-local partition state.
+/// * `buffers` - Worker buffers whose subgraph field is overwritten.
+/// * `region_aware_attrs` - Optional node-attribute columns needed by region-aware sampling.
+/// * `dist_a` - First selected district label.
+/// * `dist_b` - Second selected district label.
+fn fill_pair_subgraph(
+    graph: &Graph,
+    partition: &Partition,
+    buffers: &mut TiltedWorkerBuffers,
+    region_aware_attrs: Option<&Vec<String>>,
+    dist_a: usize,
+    dist_b: usize,
+) {
+    if let Some(attrs) = region_aware_attrs {
+        partition.subgraph_with_attr_subset(
+            graph,
+            &mut buffers.subgraph,
+            attrs.iter(),
+            dist_a,
+            dist_b,
+        );
+    } else {
+        partition.subgraph_with_attr(graph, &mut buffers.subgraph, dist_a, dist_b);
+    }
+}
+
+/// Stores the current state of the two affected districts before scoring a proposal.
+///
+/// # Arguments
+///
+/// * `partition` - Worker-local partition before applying `proposal`.
+/// * `proposal` - Candidate proposal whose district labels identify affected districts.
+/// * `revert` - Proposal buffer populated with the current district state.
+fn save_revert(partition: &Partition, proposal: &RecomProposal, revert: &mut RecomProposal) {
+    revert.a_label = proposal.a_label;
+    revert.b_label = proposal.b_label;
+    revert.a_pop = partition.dist_pops[proposal.a_label];
+    revert.b_pop = partition.dist_pops[proposal.b_label];
+    revert.a_nodes.clear();
+    revert
+        .a_nodes
+        .extend_from_slice(&partition.dist_nodes[proposal.a_label]);
+    revert.b_nodes.clear();
+    revert
+        .b_nodes
+        .extend_from_slice(&partition.dist_nodes[proposal.b_label]);
+}
+
+/// Draws one valid proposal attempt for a worker round and returns accept/reject output.
+///
+/// Invalid non-reversible proposal attempts (non-adjacent district pair, disconnected
+/// merged pair, no balanced split) are retried internally and do not count as chain
+/// self-loops. A tilted rejection does count as one self-loop.
+///
+/// # Arguments
+///
+/// * `graph` - Full graph associated with `partition`.
+/// * `partition` - Worker-local partition state, temporarily updated and reverted.
+/// * `params` - ReCom parameters used to generate splits.
+/// * `buffers` - Reusable worker buffers for subgraphs, splits, proposals, and reverts.
+/// * `st_sampler` - Spanning-tree sampler for the selected ReCom variant.
+/// * `region_aware_attrs` - Optional node-attribute columns needed by region-aware sampling.
+/// * `obj_fn` - Objective function used to score candidate proposals.
+/// * `current_score` - Objective score of the canonical chain state.
+/// * `accept_worse_prob` - Probability of accepting a non-improving proposal.
+/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
+/// * `rng` - Worker RNG used for proposal generation and acceptance.
+///
+/// # Returns
+///
+/// A `TiltedResultPacket` containing either one accepted scored proposal or one
+/// tilted rejection self-loop.
+fn draw_tilted_result(
+    graph: &Graph,
+    partition: &mut Partition,
+    params: &RecomParams,
+    buffers: &mut TiltedWorkerBuffers,
+    st_sampler: &mut Box<dyn SpanningTreeSampler>,
+    region_aware_attrs: Option<&Vec<String>>,
+    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
+    current_score: f64,
+    accept_worse_prob: f64,
+    maximize: bool,
+    rng: &mut SmallRng,
+) -> TiltedResultPacket {
+    loop {
+        let Some((dist_a, dist_b)) = uniform_dist_pair(graph, partition, rng) else {
+            continue; // retry (non-reversible)
+        };
+
+        fill_pair_subgraph(
+            graph,
+            partition,
+            buffers,
+            region_aware_attrs,
+            dist_a,
+            dist_b,
+        );
+
+        if !graph_connected(&buffers.subgraph.graph) {
+            continue; // retry (non-reversible)
+        }
+
+        st_sampler.random_spanning_tree(&buffers.subgraph.graph, &mut buffers.spanning_tree, rng);
+        let split = random_split(
+            &buffers.subgraph.graph,
+            rng,
+            &buffers.spanning_tree.st,
+            dist_a,
+            dist_b,
+            &mut buffers.split,
+            &mut buffers.proposal,
+            &buffers.subgraph.raw_nodes,
+            params,
+        );
+        if split.is_err() {
+            continue; // retry (non-reversible)
+        }
+
+        save_revert(partition, &buffers.proposal, &mut buffers.revert);
+        partition.update(&buffers.proposal);
+        let new_score = obj_fn(graph, partition);
+        partition.update(&buffers.revert);
+
+        let is_improvement = if maximize {
+            new_score >= current_score
+        } else {
+            new_score <= current_score
+        };
+        if is_improvement || rng.random::<f64>() < accept_worse_prob {
+            return TiltedResultPacket {
+                rejections: 0,
+                proposals: vec![ScoredProposal {
+                    id: rng.random::<u64>(),
+                    proposal: buffers.proposal.clone(),
+                    score: new_score,
+                }],
+            };
+        }
+
+        return TiltedResultPacket {
+            rejections: 1,
+            proposals: Vec::new(),
+        };
+    }
+}
+
 /// Starts a tilted-run worker thread.
 ///
 /// Each round, the worker draws one spanning tree, produces a proposal,
 /// temporarily applies it to score, always reverts, then decides accept/reject
 /// using the tilted criterion. Results are sent back to the main thread.
+///
+/// # Arguments
+///
+/// * `graph` - Worker-owned graph clone.
+/// * `partition` - Worker-owned partition clone kept in sync from main-thread diffs.
+/// * `params` - ReCom parameters.
+/// * `obj_fn` - Objective function used to score candidate proposals.
+/// * `accept_worse_prob` - Probability of accepting a non-improving proposal.
+/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
+/// * `rng_seed` - Seed for this worker's RNG.
+/// * `buf_size` - Capacity for two-district subgraph/proposal buffers.
+/// * `job_recv` - Channel receiving canonical-state updates from the main thread.
+/// * `result_send` - Channel sending worker accept/reject results to the main thread.
 fn start_tilted_worker(
     graph: Graph,
     mut partition: Partition,
@@ -84,150 +407,203 @@ fn start_tilted_worker(
 ) {
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
-    let mut subgraph_buf = SubgraphBuffer::new(n, buf_size);
-    let mut st_buf = SpanningTreeBuffer::new(buf_size);
-    let mut split_buf = SplitBuffer::new(buf_size, params.balance_ub as usize);
-    let mut proposal_buf = RecomProposal::new_buffer(buf_size);
-    let mut revert_buf = RecomProposal::new_buffer(buf_size);
-
-    let mut st_sampler: Box<dyn SpanningTreeSampler>;
-    let region_aware = params.variant == RecomVariant::DistrictPairsRegionAware;
-    let mut region_aware_attrs: Vec<String> = vec![];
-    if region_aware {
-        st_sampler = Box::new(RegionAwareSampler::new(
-            buf_size,
-            params
-                .region_weights
-                .clone()
-                .expect("Region weights required for region-aware ReCom."),
-        ));
-        region_aware_attrs = params
-            .region_weights
-            .clone()
-            .unwrap()
-            .iter()
-            .map(|(col, _)| col.to_owned())
-            .collect();
-    } else if params.variant == RecomVariant::DistrictPairsRMST {
-        st_sampler = Box::new(RMSTSampler::new(buf_size));
-    } else {
-        panic!("ReCom variant not supported by tilted run optimizer.");
-    }
+    let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
+    let (mut st_sampler, region_aware_attrs) = make_tilted_sampler(&params, buf_size);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
-        // Apply diff from previous round (if any).
         if let Some(diff) = next.diff {
             partition.update(&diff);
         }
-        let current_score = next.current_score;
 
-        let mut rejections: u64 = 0;
-        let mut proposals: Vec<(u64, RecomProposal, f64)> = Vec::new();
+        let result = draw_tilted_result(
+            &graph,
+            &mut partition,
+            &params,
+            &mut buffers,
+            &mut st_sampler,
+            region_aware_attrs.as_ref(),
+            obj_fn,
+            next.current_score,
+            accept_worse_prob,
+            maximize,
+            &mut rng,
+        );
 
-        // Draw one tree, produce one proposal (retry on failures like non-reversible ReCom).
-        loop {
-            let dist_pair = uniform_dist_pair(&graph, &mut partition, &mut rng);
-            if dist_pair.is_none() {
-                continue; // retry (non-reversible)
-            }
-            let (dist_a, dist_b) = dist_pair.unwrap();
-
-            if region_aware {
-                partition.subgraph_with_attr_subset(
-                    &graph,
-                    &mut subgraph_buf,
-                    region_aware_attrs.iter(),
-                    dist_a,
-                    dist_b,
-                );
-            } else {
-                partition.subgraph_with_attr(&graph, &mut subgraph_buf, dist_a, dist_b);
-            }
-
-            if !graph_connected(&subgraph_buf.graph) {
-                continue; // retry (non-reversible)
-            }
-
-            st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
-            let split = random_split(
-                &subgraph_buf.graph,
-                &mut rng,
-                &st_buf.st,
-                dist_a,
-                dist_b,
-                &mut split_buf,
-                &mut proposal_buf,
-                &subgraph_buf.raw_nodes,
-                &params,
-            );
-
-            if split.is_ok() {
-                // Save revert state for the two affected districts.
-                revert_buf.a_label = proposal_buf.a_label;
-                revert_buf.b_label = proposal_buf.b_label;
-                revert_buf.a_pop = partition.dist_pops[proposal_buf.a_label];
-                revert_buf.b_pop = partition.dist_pops[proposal_buf.b_label];
-                revert_buf.a_nodes.clear();
-                revert_buf
-                    .a_nodes
-                    .extend_from_slice(&partition.dist_nodes[proposal_buf.a_label]);
-                revert_buf.b_nodes.clear();
-                revert_buf
-                    .b_nodes
-                    .extend_from_slice(&partition.dist_nodes[proposal_buf.b_label]);
-
-                // Apply proposal and score.
-                partition.update(&proposal_buf);
-                let new_score = obj_fn(&graph, &partition);
-
-                // Always revert -- canonical state is managed by the main thread.
-                partition.update(&revert_buf);
-
-                // Tilted accept/reject.
-                let is_improvement = if maximize {
-                    new_score >= current_score
-                } else {
-                    new_score <= current_score
-                };
-                if is_improvement || rng.random::<f64>() < accept_worse_prob {
-                    proposals.push((rng.random::<u64>(), proposal_buf.clone(), new_score));
-                } else {
-                    rejections += 1;
-                }
-                break;
-            }
-            // else: no valid split, retry (non-reversible)
-        }
-
-        result_send
-            .send(TiltedResultPacket {
-                rejections,
-                proposals,
-            })
-            .unwrap();
+        result_send.send(result).unwrap();
         next = job_recv.recv().unwrap();
     }
 }
 
-/// Sends a job to a tilted-run worker thread.
-fn next_tilted_batch(send: &Sender<TiltedJobPacket>, diff: Option<RecomProposal>, score: f64) {
-    send.send(TiltedJobPacket {
-        diff,
-        current_score: score,
-        terminate: false,
-    })
-    .unwrap();
+/// Sends the next canonical chain state to every worker.
+///
+/// # Arguments
+///
+/// * `job_sends` - Worker job channels.
+/// * `diff` - Accepted proposal to broadcast, or `None` for an all-self-loop round.
+/// * `score` - Current canonical chain score.
+fn send_tilted_jobs(
+    job_sends: &[Sender<TiltedJobPacket>],
+    diff: Option<&RecomProposal>,
+    score: f64,
+) {
+    for job in job_sends.iter() {
+        job.send(TiltedJobPacket {
+            diff: diff.cloned(),
+            current_score: score,
+            terminate: false,
+        })
+        .unwrap();
+    }
 }
 
-/// Stops a tilted-run worker thread.
-fn stop_tilted_worker(send: &Sender<TiltedJobPacket>) {
-    send.send(TiltedJobPacket {
-        diff: None,
-        current_score: 0.0,
-        terminate: true,
-    })
-    .unwrap();
+/// Stops all tilted-run worker threads.
+///
+/// # Arguments
+///
+/// * `job_sends` - Worker job channels.
+fn stop_tilted_workers(job_sends: &[Sender<TiltedJobPacket>]) {
+    for job in job_sends.iter() {
+        job.send(TiltedJobPacket {
+            diff: None,
+            current_score: 0.0,
+            terminate: true,
+        })
+        .unwrap();
+    }
+}
+
+/// Blocks until each worker has returned exactly one round of tilted output.
+///
+/// # Arguments
+///
+/// * `result_recv` - Shared result channel from all workers.
+/// * `n_threads` - Number of worker packets to collect.
+///
+/// # Returns
+///
+/// The total number of tilted rejections and all worker-accepted proposals for
+/// this round.
+fn collect_tilted_results(
+    result_recv: &Receiver<TiltedResultPacket>,
+    n_threads: usize,
+) -> (usize, Vec<ScoredProposal>) {
+    let mut rejections: u64 = 0;
+    let mut proposals = Vec::<ScoredProposal>::new();
+
+    for _ in 0..n_threads {
+        let packet = result_recv.recv().unwrap();
+        rejections += packet.rejections;
+        proposals.extend(packet.proposals);
+    }
+
+    (rejections as usize, proposals)
+}
+
+/// Prints one JSONL record for a new best-seen partition.
+///
+/// # Arguments
+///
+/// * `step` - Chain step at which the improvement occurred.
+/// * `score` - New best score.
+/// * `partition` - New best partition.
+fn print_best_improvement(step: u64, score: f64, partition: &Partition) {
+    println!(
+        "{}",
+        json!({
+            "step": step,
+            "score": score,
+            "assignment": partition.assignments.clone()
+                .into_iter()
+                .enumerate()
+                .collect::<HashMap<usize, u32>>()
+        })
+        .to_string()
+    );
+}
+
+/// Interleaves one batch of worker rejections/proposals into the sequential chain.
+///
+/// Rejections increment the chain step without changing state. The first accepted
+/// proposal selected by the interleaving is applied and broadcast to workers; the
+/// caller then starts a fresh worker round from that new state.
+///
+/// # Arguments
+///
+/// * `state` - Main-thread canonical chain state.
+/// * `loops` - Number of worker tilted rejections to interleave as self-loops.
+/// * `proposals` - Worker-accepted proposals to interleave with self-loops.
+/// * `params` - ReCom parameters containing the target step count.
+/// * `rng` - Main-thread RNG used for event interleaving and proposal selection.
+/// * `job_sends` - Worker job channels for broadcasting state updates.
+/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
+/// * `verbose` - If true, print JSONL on best-seen improvements.
+fn interleave_tilted_round(
+    state: &mut TiltedMainState,
+    mut loops: usize,
+    mut proposals: Vec<ScoredProposal>,
+    params: &RecomParams,
+    rng: &mut SmallRng,
+    job_sends: &[Sender<TiltedJobPacket>],
+    maximize: bool,
+    verbose: bool,
+) {
+    if proposals.is_empty() {
+        state.step += loops as u64;
+        send_tilted_jobs(job_sends, None, state.current_score);
+        return;
+    }
+
+    proposals.sort_by_key(|proposal| proposal.id);
+    let mut total = loops + proposals.len();
+    while total > 0 && state.step < params.num_steps {
+        state.step += 1;
+        let event = rng.random_range(0..total);
+        if event < loops {
+            loops -= 1;
+            total -= 1;
+            continue;
+        }
+
+        let accepted = &proposals[rng.random_range(0..proposals.len())];
+        state.apply_accepted_proposal(accepted, maximize, verbose);
+        send_tilted_jobs(job_sends, Some(&accepted.proposal), state.current_score);
+        break; // need new round (state changed)
+    }
+}
+
+/// Runs the main-thread collection/interleaving loop after workers are spawned.
+///
+/// # Arguments
+///
+/// * `state` - Main-thread canonical chain state.
+/// * `params` - ReCom parameters containing the target step count.
+/// * `n_threads` - Number of worker packets to collect per round.
+/// * `result_recv` - Shared result channel from all workers.
+/// * `job_sends` - Worker job channels.
+/// * `rng` - Main-thread RNG used for interleaving.
+/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
+/// * `verbose` - If true, print JSONL on best-seen improvements.
+fn run_tilted_main_loop(
+    state: &mut TiltedMainState,
+    params: &RecomParams,
+    n_threads: usize,
+    result_recv: &Receiver<TiltedResultPacket>,
+    job_sends: &[Sender<TiltedJobPacket>],
+    rng: &mut SmallRng,
+    maximize: bool,
+    verbose: bool,
+) {
+    if params.num_steps > 0 {
+        send_tilted_jobs(job_sends, None, state.current_score);
+    }
+
+    while state.step < params.num_steps {
+        let (loops, proposals) = collect_tilted_results(result_recv, n_threads);
+        interleave_tilted_round(
+            state, loops, proposals, params, rng, job_sends, maximize, verbose,
+        );
+    }
 }
 
 /// Runs a tilted-run optimizer with parallel tree drawing.
@@ -249,7 +625,10 @@ fn stop_tilted_worker(send: &Sender<TiltedJobPacket>) {
 /// * `maximize` - If true, higher scores are better. If false, lower scores are better.
 /// * `verbose` - If true, print a JSONL line to stdout on each global best improvement.
 ///
-/// Returns the terminal partition state of the tilted chain.
+/// # Returns
+///
+/// `Ok(partition)` containing the terminal chain state, or `Err` if inputs are
+/// invalid or a scoped worker panics.
 pub fn multi_tilted_runs(
     graph: &Graph,
     partition: Partition,
@@ -264,7 +643,6 @@ pub fn multi_tilted_runs(
         return Err("n_threads must be at least 1".to_string());
     }
 
-    let mut step: u64 = 0;
     let node_ub = node_bound(&graph.pops, params.max_pop);
 
     let mut job_sends = vec![];
@@ -277,10 +655,7 @@ pub fn multi_tilted_runs(
     let (result_send, result_recv): (Sender<TiltedResultPacket>, Receiver<TiltedResultPacket>) =
         unbounded();
 
-    let mut current_score = obj_fn(graph, &partition);
-    let mut best_score = current_score;
-    let mut best_partition = partition.clone();
-    let mut partition = partition;
+    let current_score = obj_fn(graph, &partition);
     let mut rng: SmallRng = SeedableRng::seed_from_u64(params.rng_seed);
 
     let scoped_result = scope(|scope| -> Result<Partition, String> {
@@ -307,90 +682,20 @@ pub fn multi_tilted_runs(
             });
         }
 
-        // Initial dispatch (no diff).
-        if params.num_steps > 0 {
-            for job in job_sends.iter() {
-                next_tilted_batch(job, None, current_score);
-            }
-        }
+        let mut state = TiltedMainState::new(partition, current_score);
+        run_tilted_main_loop(
+            &mut state,
+            params,
+            n_threads,
+            &result_recv,
+            &job_sends,
+            &mut rng,
+            maximize,
+            verbose,
+        );
 
-        while step < params.num_steps {
-            // Collect results from all workers.
-            let mut total_rejections: u64 = 0;
-            let mut all_proposals: Vec<(u64, RecomProposal, f64)> = Vec::new();
-            for _ in 0..n_threads {
-                let packet: TiltedResultPacket = result_recv.recv().unwrap();
-                total_rejections += packet.rejections;
-                all_proposals.extend(packet.proposals);
-            }
-
-            let mut loops = total_rejections as usize;
-            if !all_proposals.is_empty() {
-                // Sort by random ID for deterministic interleaving.
-                all_proposals.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let mut total = loops + all_proposals.len();
-                while total > 0 && step < params.num_steps {
-                    step += 1;
-                    let event = rng.random_range(0..total);
-                    if event < loops {
-                        // Self-loop (rejection): chain stays in place.
-                        loops -= 1;
-                    } else {
-                        // Accepted proposal: apply and broadcast.
-                        let idx = rng.random_range(0..all_proposals.len());
-                        let (_, ref proposal, new_score) = all_proposals[idx];
-
-                        partition.update(proposal);
-                        current_score = new_score;
-
-                        // Track best.
-                        let is_new_best = if maximize {
-                            new_score > best_score
-                        } else {
-                            new_score < best_score
-                        };
-                        if is_new_best {
-                            best_score = new_score;
-                            best_partition = partition.clone();
-                            if verbose {
-                                println!(
-                                    "{}",
-                                    json!({
-                                        "step": step,
-                                        "score": best_score,
-                                        "assignment": best_partition.assignments.clone()
-                                            .into_iter()
-                                            .enumerate()
-                                            .collect::<HashMap<usize, u32>>()
-                                    })
-                                    .to_string()
-                                );
-                            }
-                        }
-
-                        // Broadcast accepted proposal to all workers.
-                        for job in job_sends.iter() {
-                            next_tilted_batch(job, Some(proposal.clone()), current_score);
-                        }
-                        break; // need new round (state changed)
-                    }
-                    total -= 1;
-                }
-            } else {
-                // All workers failed or rejected -- all self-loops.
-                step += total_rejections;
-                for job in job_sends.iter() {
-                    next_tilted_batch(job, None, current_score);
-                }
-            }
-        }
-
-        // Terminate worker threads.
-        for job in job_sends.iter() {
-            stop_tilted_worker(job);
-        }
-        Ok(partition)
+        stop_tilted_workers(&job_sends);
+        Ok(state.partition)
     });
 
     match scoped_result {
