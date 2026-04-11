@@ -1,7 +1,7 @@
 /// ReCom chain benchmarks.
 use frcw::graph::Graph;
 use frcw::partition::Partition;
-use frcw::recom::{RecomProposal};
+use frcw::recom::RecomProposal;
 use frcw::stats::{SelfLoopCounts, StatsWriter};
 use std::default::Default;
 

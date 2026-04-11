@@ -102,7 +102,11 @@ fn test_election_wins_aggregates_multiple_elections() {
     let e1 = 1.0 + one_below;
     let e2 = 2.8;
 
-    assert_relative_eq!(mean_obj(&graph, &partition), (e1 + e2) / 2.0, epsilon = 1e-12);
+    assert_relative_eq!(
+        mean_obj(&graph, &partition),
+        (e1 + e2) / 2.0,
+        epsilon = 1e-12
+    );
     assert_relative_eq!(min_obj(&graph, &partition), e1, epsilon = 1e-12);
     assert_relative_eq!(sum_obj(&graph, &partition), e1 + e2, epsilon = 1e-12);
 }
@@ -128,7 +132,11 @@ fn test_polsby_popper_uses_edge_attributes() {
     // Each district has area 2 and perimeter 6, so PP = 4*pi*2/6^2 = 2*pi/9.
     let per_district = 2.0 * std::f64::consts::PI / 9.0;
     assert_relative_eq!(mean_obj(&graph, &partition), per_district, epsilon = 1e-12);
-    assert_relative_eq!(sum_obj(&graph, &partition), 2.0 * per_district, epsilon = 1e-12);
+    assert_relative_eq!(
+        sum_obj(&graph, &partition),
+        2.0 * per_district,
+        epsilon = 1e-12
+    );
 }
 
 #[test]
