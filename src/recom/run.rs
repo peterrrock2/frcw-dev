@@ -135,7 +135,6 @@ fn start_job_thread(
     let region_aware = params.variant == RecomVariant::CutEdgesRegionAware
         || params.variant == RecomVariant::DistrictPairsRegionAware;
 
-    let mut region_aware_attrs: Vec<String> = vec![];
     if region_aware {
         st_sampler = Box::new(RegionAwareSampler::new(
             buf_size,
@@ -144,13 +143,6 @@ fn start_job_thread(
                 .clone()
                 .expect("Region weights required for region-aware ReCom."),
         ));
-        region_aware_attrs = params
-            .region_weights
-            .clone()
-            .unwrap()
-            .iter()
-            .map(|(col, _)| col.to_owned())
-            .collect();
     } else if rmst {
         st_sampler = Box::new(RMSTSampler::new(buf_size));
     } else {
@@ -193,19 +185,7 @@ fn start_job_thread(
                     dist_a = a;
                     dist_b = b;
                 }
-                if region_aware {
-                    // Region-aware ReCom requires extra node-level metadata
-                    // (region assignments, e.g. county IDs).
-                    partition.subgraph_with_attr_subset(
-                        &graph,
-                        &mut subgraph_buf,
-                        region_aware_attrs.iter(),
-                        dist_a,
-                        dist_b,
-                    );
-                } else {
-                    partition.subgraph(&graph, &mut subgraph_buf, dist_a, dist_b);
-                }
+                partition.subgraph(&graph, &mut subgraph_buf, dist_a, dist_b);
 
                 // A disconnected merged district pair has no spanning tree.
                 // Treat this as a rejection instead of panicking in the sampler.
@@ -225,6 +205,7 @@ fn start_job_thread(
                 // Step 3: choose a random balance edge, if possible.
                 let split = random_split(
                     &subgraph_buf.graph,
+                    &graph,
                     &mut rng,
                     &st_buf.st,
                     dist_a,

@@ -302,22 +302,6 @@ fn make_tilted_sampler(
     }
 }
 
-/// Returns the ordered region-attribute keys for region-aware variants, or an
-/// empty vector for any other variant. These keys name the node-attribute
-/// columns the region-aware cut chooser needs to read off the subgraph.
-fn region_aware_attr_keys(params: &RecomParams) -> Vec<String> {
-    match params.variant {
-        RecomVariant::CutEdgesRegionAware | RecomVariant::DistrictPairsRegionAware => params
-            .region_weights
-            .as_ref()
-            .expect("Region weights required for region-aware ReCom.")
-            .iter()
-            .map(|(col, _)| col.clone())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// Draws the next candidate district pair for a tilted proposal. Cut-edge
 /// variants pick a pair by sampling a cut edge (which always yields an
 /// adjacent pair); district-pair variants sample a pair uniformly and return
@@ -338,37 +322,25 @@ fn sample_tilted_pair(
 
 /// Copies the selected district pair into the reusable subgraph buffer.
 ///
-/// For region-aware variants, the region attribute columns listed in
-/// `region_aware_attrs` are also copied onto the subgraph so that the
-/// region-aware cut chooser can read them.
+/// Region-aware variants do not need region attributes copied onto the
+/// subgraph: the sampler reads them off the parent graph via `raw_nodes`,
+/// and the region-aware cut chooser now does the same via `subgraph_map`.
 ///
 /// # Arguments
 ///
 /// * `graph` - Full graph associated with `partition`.
 /// * `partition` - Worker-local partition state.
 /// * `buffers` - Worker buffers whose subgraph field is overwritten.
-/// * `region_aware_attrs` - Node-attribute keys to copy; empty for non-region-aware variants.
 /// * `dist_a` - First selected district label.
 /// * `dist_b` - Second selected district label.
 fn fill_pair_subgraph(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffers,
-    region_aware_attrs: &[String],
     dist_a: usize,
     dist_b: usize,
 ) {
-    if region_aware_attrs.is_empty() {
-        partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
-    } else {
-        partition.subgraph_with_attr_subset(
-            graph,
-            &mut buffers.subgraph,
-            region_aware_attrs.iter(),
-            dist_a,
-            dist_b,
-        );
-    }
+    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 }
 
 /// Stores the current state of the two affected districts before scoring a proposal.
@@ -423,7 +395,6 @@ fn draw_tilted_result(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffers,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
-    region_aware_attrs: &[String],
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
     current_score: f64,
     accept_worse_prob: f64,
@@ -436,7 +407,7 @@ fn draw_tilted_result(
             continue; // retry (non-reversible)
         };
 
-        fill_pair_subgraph(graph, partition, buffers, region_aware_attrs, dist_a, dist_b);
+        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
 
         if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue; // retry (non-reversible)
@@ -451,6 +422,7 @@ fn draw_tilted_result(
         );
         let split = random_split(
             &buffers.subgraph.graph,
+            graph,
             rng,
             &buffers.spanning_tree.st,
             dist_a,
@@ -526,7 +498,6 @@ fn start_tilted_worker(
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
     let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
-    let region_aware_attrs = region_aware_attr_keys(&params);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -540,7 +511,6 @@ fn start_tilted_worker(
             &params,
             &mut buffers,
             &mut st_sampler,
-            &region_aware_attrs,
             obj_fn,
             next.current_score,
             accept_worse_prob,
@@ -1125,29 +1095,18 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
 /// Fills the worker's subgraph buffer for the selected district pair.
 ///
 /// The incremental objective reads its inputs from the parent graph via cached
-/// state, and the region-aware sampler reads region weights off the parent
-/// graph via `raw_nodes`. The region-aware cut chooser, however, reads region
-/// attributes from the subgraph, so region attribute columns listed in
-/// `region_aware_attrs` are copied onto the subgraph for region-aware variants.
+/// state, the region-aware sampler reads region weights off the parent graph
+/// via `raw_nodes`, and the region-aware cut chooser reads region attributes
+/// off the parent graph via `subgraph_map`. The pair subgraph therefore never
+/// needs its own copy of node attribute columns.
 fn fill_pair_subgraph_incremental(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffersIncremental,
-    region_aware_attrs: &[String],
     dist_a: usize,
     dist_b: usize,
 ) {
-    if region_aware_attrs.is_empty() {
-        partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
-    } else {
-        partition.subgraph_with_attr_subset(
-            graph,
-            &mut buffers.subgraph,
-            region_aware_attrs.iter(),
-            dist_a,
-            dist_b,
-        );
-    }
+    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 }
 
 fn start_tilted_worker_incremental<O: IncrementalObjective>(
@@ -1167,7 +1126,6 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
     let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
-    let region_aware_attrs = region_aware_attr_keys(&params);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -1182,7 +1140,6 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
             &params,
             &mut buffers,
             &mut st_sampler,
-            &region_aware_attrs,
             &objective,
             &objective_state,
             next.current_score,
@@ -1205,7 +1162,6 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffersIncremental,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
-    region_aware_attrs: &[String],
     objective: &O,
     objective_state: &O::State,
     current_score: f64,
@@ -1219,14 +1175,7 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
             continue;
         };
 
-        fill_pair_subgraph_incremental(
-            graph,
-            partition,
-            buffers,
-            region_aware_attrs,
-            dist_a,
-            dist_b,
-        );
+        fill_pair_subgraph_incremental(graph, partition, buffers, dist_a, dist_b);
 
         if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue;
@@ -1241,6 +1190,7 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
         );
         let split = random_split(
             &buffers.subgraph.graph,
+            graph,
             rng,
             &buffers.spanning_tree.st,
             dist_a,

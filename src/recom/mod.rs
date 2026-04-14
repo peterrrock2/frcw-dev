@@ -209,6 +209,7 @@ fn cut_edge_dist_pair(
 /// * `params` - The parameters of the parent ReCom chain.
 pub fn random_split(
     subgraph: &Graph,
+    parent_graph: &Graph,
     rng: &mut SmallRng,
     mst: &SpanningTree,
     a: usize,
@@ -224,6 +225,7 @@ pub fn random_split(
         (RecomVariant::CutEdgesRegionAware, Ok(_))
         | (RecomVariant::DistrictPairsRegionAware, Ok(_)) => Ok(choose_region_aware_random_cut(
             subgraph,
+            parent_graph,
             rng,
             buf,
             proposal,
@@ -384,6 +386,7 @@ fn choose_random_cut(
 
 fn choose_region_aware_random_cut(
     subgraph: &Graph,
+    parent_graph: &Graph,
     rng: &mut SmallRng,
     buf: &mut SplitBuffer,
     proposal: &mut RecomProposal,
@@ -395,10 +398,13 @@ fn choose_region_aware_random_cut(
     let mut balance_nodes_by_weight = vec![];
     for (idx, &lhs) in buf.balance_nodes.iter().enumerate() {
         let rhs = buf.pred[lhs];
+        let lhs_parent = subgraph_map[lhs];
+        let rhs_parent = subgraph_map[rhs];
         // We favor balance edges that cleanly separate regions.
         let mut edge_weight = 0.0;
         for (attr, attr_weight) in region_weights.iter() {
-            if subgraph.attr[attr][lhs] != subgraph.attr[attr][rhs] {
+            let col = &parent_graph.attr[attr];
+            if col[lhs_parent] != col[rhs_parent] {
                 edge_weight += *attr_weight;
             }
         }

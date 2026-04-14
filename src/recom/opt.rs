@@ -119,6 +119,7 @@ fn start_opt_thread(
             );
             let split = random_split(
                 &subgraph_buf.graph,
+                graph,
                 &mut rng,
                 &st_buf.st,
                 dist_a,
