@@ -15,7 +15,8 @@
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
 use super::{
-    node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant,
+    cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
+    RecomVariant,
 };
 use crate::buffers::{
     graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
@@ -23,7 +24,7 @@ use crate::buffers::{
 use crate::graph::Graph;
 use crate::objectives::IncrementalObjective;
 use crate::partition::Partition;
-use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
+use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
 use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -275,40 +276,99 @@ impl TiltedMainState {
 ///
 /// * `params` - ReCom parameters containing the variant and optional region weights.
 /// * `buf_size` - Capacity used by the sampler's internal buffers.
+/// * `rng` - RNG used to seed samplers that need one (UST).
 fn make_tilted_sampler(
     params: &RecomParams,
     buf_size: usize,
+    rng: &mut SmallRng,
 ) -> Box<dyn SpanningTreeSampler> {
-    if params.variant == RecomVariant::DistrictPairsRegionAware {
-        let region_weights = params
+    match params.variant {
+        RecomVariant::DistrictPairsRMST | RecomVariant::CutEdgesRMST => {
+            Box::new(RMSTSampler::new(buf_size))
+        }
+        RecomVariant::DistrictPairsRegionAware | RecomVariant::CutEdgesRegionAware => {
+            let region_weights = params
+                .region_weights
+                .clone()
+                .expect("Region weights required for region-aware ReCom.");
+            Box::new(RegionAwareSampler::new(buf_size, region_weights))
+        }
+        RecomVariant::DistrictPairsUST | RecomVariant::CutEdgesUST => {
+            Box::new(USTSampler::new(buf_size, rng))
+        }
+        RecomVariant::Reversible => {
+            panic!("Reversible ReCom is not supported by the tilted run optimizer.");
+        }
+    }
+}
+
+/// Returns the ordered region-attribute keys for region-aware variants, or an
+/// empty vector for any other variant. These keys name the node-attribute
+/// columns the region-aware cut chooser needs to read off the subgraph.
+fn region_aware_attr_keys(params: &RecomParams) -> Vec<String> {
+    match params.variant {
+        RecomVariant::CutEdgesRegionAware | RecomVariant::DistrictPairsRegionAware => params
             .region_weights
-            .clone()
-            .expect("Region weights required for region-aware ReCom.");
-        Box::new(RegionAwareSampler::new(buf_size, region_weights))
-    } else if params.variant == RecomVariant::DistrictPairsRMST {
-        Box::new(RMSTSampler::new(buf_size))
-    } else {
-        panic!("ReCom variant not supported by tilted run optimizer.");
+            .as_ref()
+            .expect("Region weights required for region-aware ReCom.")
+            .iter()
+            .map(|(col, _)| col.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Draws the next candidate district pair for a tilted proposal. Cut-edge
+/// variants pick a pair by sampling a cut edge (which always yields an
+/// adjacent pair); district-pair variants sample a pair uniformly and return
+/// `None` if it is non-adjacent, signaling the caller to retry.
+fn sample_tilted_pair(
+    graph: &Graph,
+    partition: &mut Partition,
+    variant: RecomVariant,
+    rng: &mut SmallRng,
+) -> Option<(usize, usize)> {
+    match variant {
+        RecomVariant::CutEdgesRMST
+        | RecomVariant::CutEdgesUST
+        | RecomVariant::CutEdgesRegionAware => Some(cut_edge_dist_pair(graph, partition, rng)),
+        _ => uniform_dist_pair(graph, partition, rng),
     }
 }
 
 /// Copies the selected district pair into the reusable subgraph buffer.
+///
+/// For region-aware variants, the region attribute columns listed in
+/// `region_aware_attrs` are also copied onto the subgraph so that the
+/// region-aware cut chooser can read them.
 ///
 /// # Arguments
 ///
 /// * `graph` - Full graph associated with `partition`.
 /// * `partition` - Worker-local partition state.
 /// * `buffers` - Worker buffers whose subgraph field is overwritten.
+/// * `region_aware_attrs` - Node-attribute keys to copy; empty for non-region-aware variants.
 /// * `dist_a` - First selected district label.
 /// * `dist_b` - Second selected district label.
 fn fill_pair_subgraph(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffers,
+    region_aware_attrs: &[String],
     dist_a: usize,
     dist_b: usize,
 ) {
-    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
+    if region_aware_attrs.is_empty() {
+        partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
+    } else {
+        partition.subgraph_with_attr_subset(
+            graph,
+            &mut buffers.subgraph,
+            region_aware_attrs.iter(),
+            dist_a,
+            dist_b,
+        );
+    }
 }
 
 /// Stores the current state of the two affected districts before scoring a proposal.
@@ -363,6 +423,7 @@ fn draw_tilted_result(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffers,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
+    region_aware_attrs: &[String],
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
     current_score: f64,
     accept_worse_prob: f64,
@@ -370,11 +431,12 @@ fn draw_tilted_result(
     rng: &mut SmallRng,
 ) -> TiltedResultPacket {
     loop {
-        let Some((dist_a, dist_b)) = uniform_dist_pair(graph, partition, rng) else {
+        let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
+        else {
             continue; // retry (non-reversible)
         };
 
-        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
+        fill_pair_subgraph(graph, partition, buffers, region_aware_attrs, dist_a, dist_b);
 
         if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue; // retry (non-reversible)
@@ -463,7 +525,8 @@ fn start_tilted_worker(
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
-    let mut st_sampler = make_tilted_sampler(&params, buf_size);
+    let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
+    let region_aware_attrs = region_aware_attr_keys(&params);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -477,6 +540,7 @@ fn start_tilted_worker(
             &params,
             &mut buffers,
             &mut st_sampler,
+            &region_aware_attrs,
             obj_fn,
             next.current_score,
             accept_worse_prob,
@@ -1062,16 +1126,28 @@ impl<S: Send + Clone> TiltedMainStateIncremental<S> {
 ///
 /// The incremental objective reads its inputs from the parent graph via cached
 /// state, and the region-aware sampler reads region weights off the parent
-/// graph via `raw_nodes`, so the pair subgraph never needs its own copy of
-/// node attribute columns.
+/// graph via `raw_nodes`. The region-aware cut chooser, however, reads region
+/// attributes from the subgraph, so region attribute columns listed in
+/// `region_aware_attrs` are copied onto the subgraph for region-aware variants.
 fn fill_pair_subgraph_incremental(
     graph: &Graph,
     partition: &Partition,
     buffers: &mut TiltedWorkerBuffersIncremental,
+    region_aware_attrs: &[String],
     dist_a: usize,
     dist_b: usize,
 ) {
-    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
+    if region_aware_attrs.is_empty() {
+        partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
+    } else {
+        partition.subgraph_with_attr_subset(
+            graph,
+            &mut buffers.subgraph,
+            region_aware_attrs.iter(),
+            dist_a,
+            dist_b,
+        );
+    }
 }
 
 fn start_tilted_worker_incremental<O: IncrementalObjective>(
@@ -1090,7 +1166,8 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
-    let mut st_sampler = make_tilted_sampler(&params, buf_size);
+    let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
+    let region_aware_attrs = region_aware_attr_keys(&params);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -1105,6 +1182,7 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
             &params,
             &mut buffers,
             &mut st_sampler,
+            &region_aware_attrs,
             &objective,
             &objective_state,
             next.current_score,
@@ -1127,6 +1205,7 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
     params: &RecomParams,
     buffers: &mut TiltedWorkerBuffersIncremental,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
+    region_aware_attrs: &[String],
     objective: &O,
     objective_state: &O::State,
     current_score: f64,
@@ -1135,11 +1214,19 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
     rng: &mut SmallRng,
 ) -> TiltedResultPacket {
     loop {
-        let Some((dist_a, dist_b)) = uniform_dist_pair(graph, partition, rng) else {
+        let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
+        else {
             continue;
         };
 
-        fill_pair_subgraph_incremental(graph, partition, buffers, dist_a, dist_b);
+        fill_pair_subgraph_incremental(
+            graph,
+            partition,
+            buffers,
+            region_aware_attrs,
+            dist_a,
+            dist_b,
+        );
 
         if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue;
