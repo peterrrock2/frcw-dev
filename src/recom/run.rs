@@ -200,7 +200,13 @@ fn start_job_thread(
 
                 // Step 2: draw a random spanning tree of the subgraph induced by the
                 // two districts.
-                st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
+                st_sampler.random_spanning_tree_with_parent(
+                    &subgraph_buf.graph,
+                    &graph,
+                    &subgraph_buf.raw_nodes,
+                    &mut st_buf,
+                    &mut rng,
+                );
 
                 // Step 3: choose a random balance edge, if possible.
                 let split = random_split(

@@ -400,6 +400,81 @@ fn test_tilted_scores_writer_records_every_step() {
     fs::remove_file(path).unwrap();
 }
 
+#[rstest]
+fn test_tilted_canonical_writer_mixed_ending_counts(
+    #[values(1, 2, 4)] n_threads: usize,
+    #[values(0.1, 0.5, 0.9)] accept_worse_prob: f64,
+    #[values(1, 7, 42, 101, 2025)] seed: u64,
+) {
+    let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
+    let params = RecomParams {
+        min_pop: 5,
+        max_pop: 7,
+        num_steps: 250,
+        rng_seed: seed,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "frcw_tilted_mixed_{}_{}_{}_{}.jsonl",
+        std::process::id(),
+        n_threads,
+        (accept_worse_prob * 10.0) as u64,
+        seed,
+    ));
+    let output = Box::new(std::io::BufWriter::new(fs::File::create(&path).unwrap()));
+    let mut writer = CanonicalWriter::new(output);
+    multi_tilted_runs_with_writer(
+        &graph,
+        partition,
+        &params,
+        n_threads,
+        dist0_pop_objective,
+        accept_worse_prob,
+        true,
+        Some(&mut writer),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let output = fs::read_to_string(&path).unwrap();
+    let records: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        params.num_steps as usize + 1,
+        "expected {} records but got {} (n_threads={}, accept_worse_prob={}, seed={})",
+        params.num_steps as usize + 1,
+        records.len(),
+        n_threads,
+        accept_worse_prob,
+        seed,
+    );
+    let samples: Vec<u64> = records
+        .iter()
+        .map(|r| r["sample"].as_u64().unwrap())
+        .collect();
+    let expected: Vec<u64> = (1..=(params.num_steps + 1)).collect();
+    let expected = if samples.first().copied() == Some(1) && samples.get(1).copied() == Some(1) {
+        let mut v = vec![1u64];
+        v.extend(1..=params.num_steps);
+        v
+    } else {
+        expected
+    };
+    assert_eq!(
+        samples, expected,
+        "sample numbers not contiguous (n_threads={}, accept_worse_prob={}, seed={})",
+        n_threads, accept_worse_prob, seed,
+    );
+
+    fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn test_tilted_canonical_writer_flushes_terminal_self_loops() {
     let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);

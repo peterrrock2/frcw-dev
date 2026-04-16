@@ -491,7 +491,7 @@ impl StatsWriter for CanonicalWriter {
         counts: &SelfLoopCounts,
     ) -> Result<()> {
         let tot_count = counts.sum();
-        for i in step - tot_count as u64 + 1..step + 1 {
+        for i in step - tot_count as u64..step {
             self.output
                 .write_all(
                     format!(
