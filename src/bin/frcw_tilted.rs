@@ -395,6 +395,7 @@ fn main() {
             &shared_perim_col,
         );
     }
+    objective.cache_graph_cols(&mut graph);
     let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
     let variant = match matches
         .get_one::<String>("variant")

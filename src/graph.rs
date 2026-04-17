@@ -52,6 +52,10 @@ pub struct Graph {
     /// Indexed parallel to `edges` (i.e. `edge_attr["col"][i]` is the
     /// value for `edges[i]`).
     pub edge_attr: HashMap<String, Vec<f64>>,
+    /// Pre-parsed integer node attributes, cached to avoid repeated string
+    /// parsing on the hot path. Only populated for columns explicitly
+    /// registered via [`Graph::cache_int_col`].
+    pub int_attr: HashMap<String, Vec<i32>>,
 }
 
 impl Graph {
@@ -66,7 +70,39 @@ impl Graph {
             total_pop: 0,
             attr: HashMap::new(),
             edge_attr: HashMap::new(),
+            int_attr: HashMap::new(),
         }
+    }
+
+    /// Parses an integer-valued node attribute column from `attr` and caches
+    /// the result in `int_attr`. Accepts whole-number float strings such as
+    /// `"1044.0"` (common when data originates from pandas float64 columns).
+    ///
+    /// Panics if `col` is absent from `attr`, or if any value cannot be
+    /// represented as an `i32`, naming the column and node index.
+    pub fn cache_int_col(&mut self, col: &str) {
+        let parsed: Vec<i32> = self
+            .attr
+            .get(col)
+            .unwrap_or_else(|| panic!("Missing node attribute '{}'", col))
+            .iter()
+            .enumerate()
+            .map(|(n, val)| {
+                val.parse::<i32>().unwrap_or_else(|_| {
+                    val.parse::<f64>()
+                        .ok()
+                        .filter(|&f| f.fract() == 0.0)
+                        .map(|f| f as i32)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Could not parse value '{}' as integer for column '{}' at node {}",
+                                val, col, n
+                            )
+                        })
+                })
+            })
+            .collect();
+        self.int_attr.insert(col.to_string(), parsed);
     }
 
     /// Initializes a graph from a newline-delimited edge list format representation.
@@ -177,6 +213,7 @@ impl Graph {
             edges_start: edges_start,
             attr: HashMap::new(),
             edge_attr: HashMap::new(),
+            int_attr: HashMap::new(),
         })
     }
 
@@ -221,6 +258,7 @@ impl Graph {
             total_pop: size as u32,
             attr: HashMap::new(),
             edge_attr: HashMap::new(),
+            int_attr: HashMap::new(),
         }
     }
 

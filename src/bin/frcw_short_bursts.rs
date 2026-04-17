@@ -100,6 +100,34 @@ fn main() {
                     Must be entered into the command line using the format:\n\
                     \t'{\"region_col1\": weight1, \"region_col2\": weight2, ...}'",
                 ),
+        )
+        .arg(
+            Arg::new("maximize")
+                .long("maximize")
+                .value_parser(value_parser!(bool))
+                .default_value("true")
+                .help("If true, maximize the objective. If false, minimize it."),
+        )
+        .arg(
+            Arg::new("variant")
+                .long("variant")
+                .value_parser(value_parser!(String))
+                .default_value("district-pairs-rmst")
+                .help(
+                    "The variant of the ReCom proposal to use.\n\
+                    \tcut-edges-rmst (ReCom-A): sample district pairs by selecting one of the cut \
+                        edges of the previous plan uniformly at random. Sample using minimum \
+                        spanning trees.\n\
+                    \tdistrict-pairs-rmst (ReCom-B, default): sample pairs of districts uniformly \
+                        at random from the space of all possible pairings. Sample using minimum \
+                        spanning trees.\n\
+                    \tcut-edges-ust (ReCom-C): sample district pairs by selecting one of the cut \
+                        edges of the previous plan uniformly at random. Sample using uniform \
+                        spanning trees. \n\
+                    \tdistrict-pairs-ust (ReCom-D): sample pairs of districts uniformly at random \
+                        from the space of all possible pairings. Sample using uniform spanning \
+                        trees.",
+                ),
         );
 
     let matches = cli.get_matches();
@@ -117,6 +145,13 @@ fn main() {
     let burst_length = *matches
         .get_one::<usize>("burst_length")
         .expect("burst_length is required");
+    let maximize = *matches
+        .get_one::<bool>("maximize")
+        .expect("maximize is required");
+    let variant_str = matches
+        .get_one::<String>("variant")
+        .expect("variant has a default value")
+        .as_str();
 
     let graph_path = matches
         .get_one::<String>("graph_json")
@@ -188,16 +223,39 @@ fn main() {
     )
     .unwrap();
     let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+    let variant = match variant_str {
+        "cut-edges-rmst" => match region_weights {
+            None => RecomVariant::CutEdgesRMST,
+            Some(_) => RecomVariant::CutEdgesRegionAware,
+        },
+        "district-pairs-rmst" => match region_weights {
+            None => RecomVariant::DistrictPairsRMST,
+            Some(_) => RecomVariant::DistrictPairsRegionAware,
+        },
+        "cut-edges-ust" => match region_weights {
+            None => RecomVariant::CutEdgesUST,
+            Some(_) => {
+                panic!("Region-aware variants are not currently implemented for uniform spanning tree sampling.")
+            }
+        },
+        "district-pairs-ust" => match region_weights {
+            None => RecomVariant::DistrictPairsUST,
+            Some(_) => {
+                panic!("Region-aware variants are not currently implemented for uniform spanning tree sampling.")
+            }
+        },
+        "reversible" => {
+            panic!("Reversible ReCom is not supported by the short bursts optimizer.")
+        }
+        bad => panic!("Parameter error: invalid variant '{}'", bad),
+    };
     let params = RecomParams {
         min_pop: ((1.0 - tol) * avg_pop as f64).ceil() as u32,
         max_pop: ((1.0 + tol) * avg_pop as f64).floor() as u32,
         num_steps: n_steps,
         rng_seed: rng_seed,
         balance_ub: 0,
-        variant: match region_weights {
-            None => RecomVariant::DistrictPairsRMST,
-            Some(_) => RecomVariant::DistrictPairsRegionAware,
-        },
+        variant,
         region_weights: region_weights.clone(),
     };
 
@@ -217,6 +275,8 @@ fn main() {
         "parallel": true,
         "type": "short_bursts",
         "burst_length": burst_length,
+        "maximize": maximize,
+        "variant": variant_str,
         "graph_json": graph_json,
     });
     if region_weights.is_some() {
@@ -231,6 +291,7 @@ fn main() {
         &params,
         n_threads,
         objective_fn,
+        maximize,
         burst_length,
         true,
     );

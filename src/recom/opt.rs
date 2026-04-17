@@ -2,17 +2,18 @@
 //!
 //! We use the "short bursts" heuristic introduced in Cannon et al. 2020
 //! (see "Voting Rights, Markov Chains, and Optimization by Short Bursts",
-//!  arXiv: 2011.02288) to maximize arbitrary partition-level objective
+//!  arXiv: 2011.02288) to optimize arbitrary partition-level objective
 //! functions.
 use super::{
-    node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal, RecomVariant,
+    cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
+    RecomVariant,
 };
 use crate::buffers::{
     graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
 };
 use crate::graph::Graph;
 use crate::partition::Partition;
-use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler};
+use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
 use crossbeam::scope;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rand::rngs::SmallRng;
@@ -41,6 +42,49 @@ struct OptResultPacket {
     best_score: Option<ScoreValue>,
 }
 
+/// Builds the spanning-tree sampler for the supported variants.
+fn make_opt_sampler(
+    params: &RecomParams,
+    buf_size: usize,
+    rng: &mut SmallRng,
+) -> Box<dyn SpanningTreeSampler> {
+    match params.variant {
+        RecomVariant::DistrictPairsRMST | RecomVariant::CutEdgesRMST => {
+            Box::new(RMSTSampler::new(buf_size))
+        }
+        RecomVariant::DistrictPairsRegionAware | RecomVariant::CutEdgesRegionAware => {
+            let region_weights = params
+                .region_weights
+                .clone()
+                .expect("Region weights required for region-aware ReCom.");
+            Box::new(RegionAwareSampler::new(buf_size, region_weights))
+        }
+        RecomVariant::DistrictPairsUST | RecomVariant::CutEdgesUST => {
+            Box::new(USTSampler::new(buf_size, rng))
+        }
+        RecomVariant::Reversible => {
+            panic!("Reversible ReCom is not supported by the short bursts optimizer.");
+        }
+    }
+}
+
+/// Draws the next candidate district pair. Cut-edge variants pick a pair by
+/// sampling a cut edge; district-pair variants sample uniformly and return
+/// `None` if the pair is non-adjacent.
+fn sample_opt_pair(
+    graph: &Graph,
+    partition: &mut Partition,
+    variant: RecomVariant,
+    rng: &mut SmallRng,
+) -> Option<(usize, usize)> {
+    match variant {
+        RecomVariant::CutEdgesRMST
+        | RecomVariant::CutEdgesUST
+        | RecomVariant::CutEdgesRegionAware => Some(cut_edge_dist_pair(graph, partition, rng)),
+        _ => uniform_dist_pair(graph, partition, rng),
+    }
+}
+
 /// Starts a ReCom optimization thread.
 /// ReCom optimization threads run short ReCom chains ("short bursts"), which
 /// are then aggregated by the main thread.
@@ -60,6 +104,7 @@ fn start_opt_thread(
     mut partition: Partition,
     params: RecomParams,
     obj_fn: impl Fn(&Graph, &Partition) -> ScoreValue + Send + Clone + Copy,
+    maximize: bool,
     rng_seed: u64,
     buf_size: usize,
     job_recv: Receiver<OptJobPacket>,
@@ -77,17 +122,7 @@ fn start_opt_thread(
     let mut split_buf = SplitBuffer::new(buf_size, params.balance_ub as usize);
     let mut proposal_buf = RecomProposal::new_buffer(buf_size);
     let mut connectivity_buf = ConnectivityBuffers::new(buf_size);
-    let mut st_sampler: Box<dyn SpanningTreeSampler>;
-    if params.variant == RecomVariant::DistrictPairsRegionAware {
-        st_sampler = Box::new(RegionAwareSampler::new(
-            buf_size,
-            params.region_weights.clone().unwrap(),
-        ));
-    } else if params.variant == RecomVariant::DistrictPairsRMST {
-        st_sampler = Box::new(RMSTSampler::new(buf_size));
-    } else {
-        panic!("ReCom variant not supported by optimizer.");
-    }
+    let mut st_sampler = make_opt_sampler(&params, buf_size, &mut rng);
 
     let mut next: OptJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -101,7 +136,7 @@ fn start_opt_thread(
         let mut step = 0;
         while step < next.n_steps {
             // Sample a ReCom step.
-            let dist_pair = uniform_dist_pair(graph, &mut partition, &mut rng);
+            let dist_pair = sample_opt_pair(graph, &mut partition, params.variant, &mut rng);
             if dist_pair.is_none() {
                 continue;
             }
@@ -132,7 +167,7 @@ fn start_opt_thread(
             if split.is_ok() {
                 score = obj_fn(graph, &partition);
                 partition.update(&proposal_buf);
-                if score >= best_score {
+                if (maximize && score >= best_score) || (!maximize && score <= best_score) {
                     // TODO: reduce allocations by keeping a separate
                     // buffer for the best partition.
                     best_partition = Some(partition.clone());
@@ -192,6 +227,7 @@ pub fn multi_short_bursts(
     params: &RecomParams,
     n_threads: usize,
     obj_fn: impl Fn(&Graph, &Partition) -> ScoreValue + Send + Clone + Copy,
+    maximize: bool,
     burst_length: usize,
     verbose: bool,
 ) -> Result<Partition, String> {
@@ -224,6 +260,7 @@ pub fn multi_short_bursts(
                     worker_partition,
                     params.clone(),
                     obj_fn,
+                    maximize,
                     rng_seed,
                     node_ub,
                     job_recv,
@@ -242,7 +279,10 @@ pub fn multi_short_bursts(
             let mut diff = None;
             for _ in 0..n_threads {
                 let packet: OptResultPacket = result_recv.recv().unwrap();
-                if packet.best_partition.is_some() && packet.best_score.unwrap() >= score {
+                if packet.best_partition.is_some()
+                    && ((maximize && packet.best_score.unwrap() >= score)
+                        || (!maximize && packet.best_score.unwrap() <= score))
+                {
                     partition = packet.best_partition.unwrap();
                     score = packet.best_score.unwrap();
                     diff = Some(partition.clone());

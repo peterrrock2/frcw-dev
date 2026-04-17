@@ -283,6 +283,35 @@ impl ObjectiveConfig {
             }
         }
     }
+
+    /// Parses and caches the integer node attribute columns required by this
+    /// objective. Call this once on the mutable graph before starting the chain.
+    ///
+    /// For [`ObjectiveConfig::ElectionWins`] and [`ObjectiveConfig::GinglesPartial`],
+    /// this populates `graph.int_attr` with the parsed vote/population columns so
+    /// that the hot-path incremental scoring functions can index directly into
+    /// `Vec<i32>` rather than re-parsing strings on every proposal.
+    ///
+    /// Panics if any required column is missing or contains a non-integer value.
+    pub fn cache_graph_cols(&self, graph: &mut Graph) {
+        match self {
+            ObjectiveConfig::ElectionWins { elections, .. } => {
+                for &(col_a, col_b) in elections.iter() {
+                    graph.cache_int_col(col_a);
+                    graph.cache_int_col(col_b);
+                }
+            }
+            ObjectiveConfig::GinglesPartial {
+                min_pop_col,
+                total_pop_col,
+                ..
+            } => {
+                graph.cache_int_col(min_pop_col);
+                graph.cache_int_col(total_pop_col);
+            }
+            ObjectiveConfig::PolsbyPopper { .. } => {}
+        }
+    }
 }
 
 /// Parses an objective configuration JSON string into a `Copy` [`ObjectiveConfig`].
@@ -665,17 +694,17 @@ pub trait IncrementalObjective: Send + Clone {
     }
 }
 
-/// Sums an integer-valued node attribute over a set of nodes.
+/// Sums a pre-cached integer node attribute over a set of nodes.
+/// Panics if `col` has not been registered via [`Graph::cache_int_col`]
+/// (i.e. via [`ObjectiveConfig::cache_graph_cols`] before the chain starts).
 fn sum_attr_over(graph: &Graph, col: &str, nodes: &[usize]) -> i32 {
-    let values = graph
-        .attr
-        .get(col)
-        .unwrap_or_else(|| panic!("Missing node attribute '{}'", col));
-    nodes
-        .iter()
-        .map(|&n| values[n].parse::<i32>())
-        .collect::<Result<Vec<i32>, _>>()
-        .map_or(-1, |nums| nums.iter().sum::<i32>())
+    let values = graph.int_attr.get(col).unwrap_or_else(|| {
+        panic!(
+            "Column '{}' has not been pre-cached; call cache_graph_cols before running the chain",
+            col
+        )
+    });
+    nodes.iter().map(|&n| values[n]).sum()
 }
 
 /// Per-district outcome for election-wins scoring.
@@ -812,11 +841,8 @@ impl GinglesPartialState {
             if share >= threshold {
                 opportunity_count += 1;
             } else if share > best_below_share || best_below_dist.is_none() {
-                // Track the first below-threshold district even if its share is 0.
-                if share >= best_below_share {
-                    best_below_share = share;
-                    best_below_dist = Some(d);
-                }
+                best_below_share = share;
+                best_below_dist = Some(d);
             }
         }
         let score = opportunity_count as f64 + (best_below_share / threshold);
@@ -1760,7 +1786,8 @@ mod incremental_tests {
     }
 
     fn run_equivalence_suite(obj: ObjectiveConfig) {
-        let (graph, partition) = make_test_graph_and_partition();
+        let (mut graph, partition) = make_test_graph_and_partition();
+        obj.cache_graph_cols(&mut graph);
 
         // Cached init score must match full-score.
         let state = obj.init(&graph, &partition);

@@ -228,7 +228,9 @@ pub fn graph_from_networkx(
         for col in columns.iter() {
             if let Some(data) = attr.get_mut(col) {
                 match node.get(col) {
-                    Some(value) => data.push(value.to_string()),
+                    Some(value) => data.push(
+                        value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+                    ),
                     None => panic!(
                         "Node {} is missing required attribute '{}'. \
                          If this column applies only to some nodes, pass it \
@@ -241,7 +243,9 @@ pub fn graph_from_networkx(
         for col in partial_columns.iter() {
             if let Some(data) = attr.get_mut(col) {
                 match node.get(col) {
-                    Some(value) => data.push(value.to_string()),
+                    Some(value) => data.push(
+                        value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+                    ),
                     None => data.push("null".to_string()),
                 }
             }
@@ -313,6 +317,7 @@ pub fn graph_from_networkx(
         total_pop: total_pop,
         attr: attr,
         edge_attr: edge_attr,
+        int_attr: std::collections::HashMap::new(),
     };
     return Ok((graph, data));
 }
