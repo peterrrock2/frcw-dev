@@ -12,10 +12,13 @@ use crate::buffers::{
     graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
 };
 use crate::graph::Graph;
+use crate::objectives::{IncrementalObjective, ObjectiveConfig};
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
+use crate::stats::{ScoresWriter, SelfLoopCounts, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use serde_json::json;
@@ -313,5 +316,197 @@ pub fn multi_short_bursts(
 
         // This only happens if some thread panicked.
         Err(_panic) => Err("multi_chain panicked in a worker thread".to_string()),
+    }
+}
+
+/// Runs a multi-threaded ReCom short bursts optimizer with incremental scoring
+/// and optional output writers.
+///
+/// Workers run short ReCom bursts using the full `ObjectiveConfig::score` path.
+/// The main thread maintains per-district cached state via the incremental
+/// interface for use by the optional writers. Writers are called synchronously
+/// on the main thread: `stats_writer` is called whenever a new global best is
+/// found; `scores_writer` is called at each burst boundary.
+///
+/// Because short bursts workers return only the best partition seen in a burst
+/// (not the individual proposals), the stats writer receives a synthetic empty
+/// proposal on each call. Writers that require proposal-level data (TSV, JSONL,
+/// pcompress) will produce empty/zeroed proposal fields. Prefer the
+/// `assignments`, `canonicalized-assignments`, `canonical`, or `ben` writers
+/// when using short bursts.
+///
+/// # Arguments
+///
+/// * `graph` - The graph associated with `partition`.
+/// * `partition` - The partition to start the chain run from.
+/// * `params` - The parameters of the ReCom chain runs.
+/// * `n_threads` - The number of worker threads (excluding the main thread).
+/// * `objective` - The incremental objective configuration (`Copy`).
+/// * `maximize` - If true, maximize the objective. If false, minimize it.
+/// * `burst_length` - The number of accepted steps per short burst per worker.
+/// * `stats_writer` - Optional writer called when a new global best is found.
+/// * `scores_writer` - Optional writer called at each burst boundary.
+/// * `show_progress` - If true, display a progress bar to stdout.
+pub fn multi_short_bursts_incremental_with_writer(
+    graph: &Graph,
+    mut partition: Partition,
+    params: &RecomParams,
+    n_threads: usize,
+    objective: ObjectiveConfig,
+    maximize: bool,
+    burst_length: usize,
+    mut stats_writer: Option<&mut dyn StatsWriter>,
+    mut scores_writer: Option<&mut ScoresWriter>,
+    show_progress: bool,
+) -> Result<Partition, String> {
+    let mut step = 1u64;
+    let node_ub = node_bound(&graph.pops, params.max_pop);
+    let mut job_sends = vec![];
+    let mut job_recvs = vec![];
+    for _ in 0..n_threads {
+        let (s, r): (Sender<OptJobPacket>, Receiver<OptJobPacket>) = unbounded();
+        job_sends.push(s);
+        job_recvs.push(r);
+    }
+    let (result_send, result_recv): (Sender<OptResultPacket>, Receiver<OptResultPacket>) =
+        unbounded();
+
+    // Build initial incremental state for writer initialization.
+    let initial_obj_state = objective.init(graph, &partition);
+    let initial_score = objective.score_state(&initial_obj_state);
+    if let Some(writer) = stats_writer.as_mut() {
+        writer.init(graph, &partition).unwrap();
+    }
+    if let Some(writer) = scores_writer.as_mut() {
+        let ds = objective.district_scores(&initial_obj_state);
+        writer.init(initial_score, &ds).unwrap();
+    }
+
+    // Worker closure: full-score path (ObjectiveConfig is Copy).
+    let obj_fn = move |graph: &Graph, partition: &Partition| -> ScoreValue {
+        objective.score(graph, partition)
+    };
+
+    let progress_bar = if show_progress {
+        let pb = ProgressBar::with_draw_target(
+            Some(params.num_steps),
+            indicatif::ProgressDrawTarget::stdout_with_hz(1),
+        );
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:100.cyan/blue} {pos:>10}/{len} ({eta_precise})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    let scoped_result = scope(|scope| -> Result<Partition, String> {
+        for t_idx in 0..n_threads {
+            let rng_seed = params.rng_seed + t_idx as u64 + 1;
+            let job_recv = job_recvs[t_idx].clone();
+            let result_send = result_send.clone();
+            let worker_partition = partition.clone();
+
+            scope.spawn(move |_| {
+                start_opt_thread(
+                    graph,
+                    worker_partition,
+                    params.clone(),
+                    obj_fn,
+                    maximize,
+                    rng_seed,
+                    node_ub,
+                    job_recv,
+                    result_send,
+                );
+            });
+        }
+
+        if params.num_steps > 0 {
+            for job in job_sends.iter() {
+                next_batch(job, None, burst_length);
+            }
+        }
+
+        let mut score = initial_score;
+        let mut best_obj_state = initial_obj_state;
+
+        while step < params.num_steps {
+            let mut diff: Option<Partition> = None;
+            for _ in 0..n_threads {
+                let packet: OptResultPacket = result_recv.recv().unwrap();
+                if let Some(new_score) = packet.best_score {
+                    if (maximize && new_score >= score) || (!maximize && new_score <= score) {
+                        partition = packet.best_partition.unwrap();
+                        score = new_score;
+                        diff = Some(partition.clone());
+                    }
+                }
+            }
+            step += (n_threads * burst_length) as u64;
+
+            // When a new best is found: update incremental state and call stats writer.
+            if diff.is_some() {
+                best_obj_state = objective.init(graph, &partition);
+                if let Some(writer) = stats_writer.as_mut() {
+                    // Short bursts workers return partitions, not proposals.
+                    // Writers that ignore the proposal (assignments, BEN, canonical)
+                    // work correctly. Writers that use proposal fields will see zeros.
+                    let dummy = RecomProposal {
+                        a_label: 0,
+                        b_label: 0,
+                        a_pop: 0,
+                        b_pop: 0,
+                        a_nodes: Vec::new(),
+                        b_nodes: Vec::new(),
+                    };
+                    writer
+                        .step(step, graph, &partition, &dummy, &SelfLoopCounts::default())
+                        .unwrap();
+                }
+            }
+
+            // Call scores writer at each burst boundary.
+            if let Some(writer) = scores_writer.as_mut() {
+                let ds = objective.district_scores(&best_obj_state);
+                writer.step(step, score, score, &ds).unwrap();
+            }
+
+            if let Some(pb) = progress_bar.as_ref() {
+                pb.set_position(step.min(params.num_steps));
+            }
+
+            for job in job_sends.iter() {
+                next_batch(job, diff.clone(), burst_length);
+            }
+        }
+
+        for job in job_sends.iter() {
+            stop_opt_thread(job);
+        }
+        Ok(partition)
+    });
+
+    if let Some(pb) = progress_bar {
+        pb.set_position(params.num_steps);
+        pb.finish_and_clear();
+    }
+
+    if let Some(writer) = stats_writer {
+        writer.close().unwrap();
+    }
+    if let Some(writer) = scores_writer {
+        writer.close().unwrap();
+    }
+
+    match scoped_result {
+        Ok(inner) => inner,
+        Err(_panic) => {
+            Err("multi_short_bursts_incremental panicked in a worker thread".to_string())
+        }
     }
 }
