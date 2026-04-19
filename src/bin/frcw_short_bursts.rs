@@ -237,6 +237,16 @@ fn main() {
                 .long("show-progress")
                 .action(ArgAction::SetTrue)
                 .help("Whether to show a progress bar during execution."),
+        )
+        .arg(
+            Arg::new("write-best-only")
+                .long("write-best-only")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "When set, the output writer records only partitions that improve the \
+                    global best objective score. By default every accepted chain step is \
+                    written. Has no effect when --output-file is not provided.",
+                ),
         );
 
     let matches = cli.get_matches();
@@ -267,6 +277,7 @@ fn main() {
         .as_str();
     let overwrite_output = matches.get_flag("overwrite-output");
     let show_progress = matches.get_flag("show-progress");
+    let write_best_only = matches.get_flag("write-best-only");
 
     let metadata_base_path = matches
         .get_one::<String>("output-file")
@@ -453,6 +464,7 @@ fn main() {
         "variant": variant_str,
         "overwrite_output": overwrite_output,
         "show_progress": show_progress,
+        "write_best_only": write_best_only,
         "graph_json": graph_json,
     });
     if let Some(path) = matches.get_one::<String>("output-file") {
@@ -516,6 +528,7 @@ fn main() {
             .map(|writer| &mut **writer as &mut dyn StatsWriter),
         scores_writer.as_mut(),
         show_progress,
+        write_best_only,
     );
 
     match output {
