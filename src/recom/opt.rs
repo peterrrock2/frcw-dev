@@ -168,8 +168,8 @@ fn start_opt_thread(
                 &params,
             );
             if split.is_ok() {
-                score = obj_fn(graph, &partition);
                 partition.update(&proposal_buf);
+                score = obj_fn(graph, &partition);
                 if (maximize && score >= best_score) || (!maximize && score <= best_score) {
                     // TODO: reduce allocations by keeping a separate
                     // buffer for the best partition.
