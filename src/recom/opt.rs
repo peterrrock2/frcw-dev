@@ -487,6 +487,11 @@ pub fn multi_short_bursts_incremental_with_writer(
     // Collect per-step partitions only when the writer needs every step.
     let collect_all = !write_best_only;
 
+    // The stats writer emits the seed plan in init(), which counts as the
+    // first output record. To keep the total output record count equal to
+    // params.num_steps, we run one fewer chain step.
+    let effective_steps = params.num_steps.saturating_sub(1);
+
     let progress_bar = if show_progress {
         let pb = ProgressBar::with_draw_target(
             Some(params.num_steps),
@@ -527,7 +532,7 @@ pub fn multi_short_bursts_incremental_with_writer(
             });
         }
 
-        if params.num_steps > 0 {
+        if effective_steps > 0 {
             for job in job_sends.iter() {
                 next_batch(job, None, burst_length);
             }
@@ -548,7 +553,7 @@ pub fn multi_short_bursts_incremental_with_writer(
             b_nodes: Vec::new(),
         };
 
-        while step < params.num_steps {
+        while step < effective_steps {
             let mut all_packets: Vec<OptResultPacketFull> = Vec::with_capacity(n_threads);
             for _ in 0..n_threads {
                 all_packets.push(result_recv.recv().unwrap());
@@ -585,19 +590,23 @@ pub fn multi_short_bursts_incremental_with_writer(
             } else {
                 // Call stats_writer for every accepted step; also track new
                 // global bests for the scores_writer and the next burst diff.
+                // Cap writes at effective_steps so total records = num_steps
+                // (the seed written by init counts as the first record).
                 for packet in all_packets {
                     for (stepped_partition, stepped_score) in packet.all_steps {
-                        writer_step += 1;
-                        if let Some(writer) = stats_writer.as_mut() {
-                            writer
-                                .step(
-                                    writer_step,
-                                    graph,
-                                    &stepped_partition,
-                                    &dummy,
-                                    &SelfLoopCounts::default(),
-                                )
-                                .unwrap();
+                        if writer_step < effective_steps {
+                            writer_step += 1;
+                            if let Some(writer) = stats_writer.as_mut() {
+                                writer
+                                    .step(
+                                        writer_step,
+                                        graph,
+                                        &stepped_partition,
+                                        &dummy,
+                                        &SelfLoopCounts::default(),
+                                    )
+                                    .unwrap();
+                            }
                         }
                         if (maximize && stepped_score >= score)
                             || (!maximize && stepped_score <= score)
@@ -620,7 +629,7 @@ pub fn multi_short_bursts_incremental_with_writer(
             }
 
             if let Some(pb) = progress_bar.as_ref() {
-                pb.set_position(step.min(params.num_steps));
+                pb.set_position((step + 1).min(params.num_steps));
             }
 
             for job in job_sends.iter() {

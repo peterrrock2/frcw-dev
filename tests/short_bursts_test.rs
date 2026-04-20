@@ -162,17 +162,15 @@ fn test_short_bursts_writer_records_every_accepted_step() {
         );
     }
 
-    // Total writer calls must equal n_rounds * burst_length * n_threads.
-    let n_rounds = params.num_steps.div_ceil((n_threads * burst_length) as u64);
-    let expected_steps = n_rounds * (n_threads * burst_length) as u64;
+    // Total writer calls must equal num_steps - 1: the seed written by init
+    // counts as the first output record, so chain steps fill the remaining slots.
+    let expected_steps = params.num_steps - 1;
     assert_eq!(
         writer.steps.len() as u64,
         expected_steps,
-        "Expected {} writer calls (n_rounds={} x burst={}), got {}",
+        "Expected {} writer calls (num_steps - 1), got {}",
         expected_steps,
-        n_rounds,
-        burst_length,
-        writer.partitions.len()
+        writer.steps.len()
     );
 }
 
