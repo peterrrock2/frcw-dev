@@ -387,7 +387,11 @@ pub fn multi_chain(
             });
         }
 
-        if params.num_steps > 0 {
+        // writer.init() writes the seed plan as record 0, so we run for one fewer
+        // chain event to keep the total output record count equal to num_steps.
+        let effective_steps = params.num_steps.saturating_sub(1);
+
+        if effective_steps > 0 {
             for job in job_sends.iter() {
                 job.send(JobPacket {
                     n_steps: batch_size,
@@ -399,7 +403,7 @@ pub fn multi_chain(
         }
         let mut sampled = SelfLoopCounts::default();
         let mut previously_accepted_proposal: Option<RecomProposal> = None;
-        while step < params.num_steps {
+        while step < effective_steps {
             let mut counts = SelfLoopCounts::default();
             let mut proposals = Vec::<(u64, RecomProposal)>::new();
             // This is where the proposals are assigned
@@ -415,7 +419,7 @@ pub fn multi_chain(
                 proposals.sort_by(|a, b| a.0.cmp(&b.0));
 
                 let mut total = loops + proposals.len();
-                while total > 0 && step < params.num_steps {
+                while total > 0 && step < effective_steps {
                     step += 1;
 
                     if let Some(pb) = pb_ref {
@@ -460,7 +464,7 @@ pub fn multi_chain(
                 step += loops as u64;
 
                 if let Some(pb) = pb_ref {
-                    let remaining = params.num_steps - progress_count;
+                    let remaining = effective_steps.saturating_sub(progress_count);
                     let inc = remaining.min(loops as u64);
                     progress_count += inc;
                     if progress_count - last_drawn >= progress_chunk {
