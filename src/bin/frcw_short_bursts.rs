@@ -47,6 +47,18 @@ fn metadata_path(output_path: &str) -> PathBuf {
     output_path.with_file_name(format!("{}_metadata.jsonl", file_stem))
 }
 
+/// Resolves the value of `--objective` to a JSON string.
+/// Values that start with `{` are used as-is (inline JSON).
+/// All other values are treated as file paths and the file contents are returned.
+fn load_objective_config(arg: &str) -> String {
+    if arg.trim_start().starts_with('{') {
+        arg.to_string()
+    } else {
+        fs::read_to_string(arg)
+            .unwrap_or_else(|e| panic!("Could not read objective file '{}': {}", arg, e))
+    }
+}
+
 fn make_stats_writer(
     writer_str: &str,
     output_buffer: Box<dyn io::Write + Send>,
@@ -150,7 +162,10 @@ fn main() {
             Arg::new("objective")
                 .long("objective")
                 .required(true)
-                .help("A JSON-formatted objective function configuration."),
+                .help(
+                    "Objective function configuration. Either a JSON string \
+                     (must start with '{') or a path to a JSON file.",
+                ),
         )
         .arg(
             Arg::new("region_weights")
@@ -371,10 +386,12 @@ fn main() {
         }
     }
 
-    let objective_config = matches
-        .get_one::<String>("objective")
-        .expect("objective is required")
-        .as_str();
+    let objective_config = load_objective_config(
+        matches
+            .get_one::<String>("objective")
+            .expect("objective is required"),
+    );
+    let objective_config = objective_config.as_str();
     let objective = make_objective(objective_config);
     let edge_cols = required_edge_cols(objective_config);
     for col in required_node_cols(objective_config) {
