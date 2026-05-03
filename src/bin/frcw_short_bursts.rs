@@ -10,7 +10,7 @@ use frcw::objectives::{
     ensure_derived_perim_column, make_objective, partial_node_cols, polsby_popper_autoderive,
     required_edge_cols, required_node_cols,
 };
-use frcw::recom::opt::multi_short_bursts_incremental_with_writer;
+use frcw::recom::short_bursts::multi_short_bursts_with_writer;
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{
     AssignmentsOnlyWriter, BenWriter, CanonicalWriter, JSONLWriter, PcompressWriter, ScoresWriter,
@@ -532,7 +532,7 @@ fn main() {
         .get_one::<String>("scores-output-file")
         .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
-    let output = multi_short_bursts_incremental_with_writer(
+    let output = multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,

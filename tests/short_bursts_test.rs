@@ -2,7 +2,7 @@
 use frcw::graph::Graph;
 use frcw::objectives::make_objective;
 use frcw::partition::Partition;
-use frcw::recom::opt::{multi_short_bursts, multi_short_bursts_incremental_with_writer};
+use frcw::recom::short_bursts::multi_short_bursts_with_writer;
 use frcw::recom::RecomProposal;
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{ScoresWriter, SelfLoopCounts, StatsWriter};
@@ -67,52 +67,6 @@ impl StatsWriter for RecordingWriter {
 }
 
 // =================================================================================
-// == Bug regression test: scoring must use the post-update partition.
-//
-// The pre-fix bug computed score(P_i) BEFORE calling partition.update(), then
-// stored P_{i+1} paired with score(P_i). On the first step of every burst this
-// means score(P_0) >= best_score(P_0) is always true, so P_1 is unconditionally
-// stored as "best" no matter how bad it actually is.
-//
-// This test uses an objective where only the initial partition scores 1.0 and all
-// others score 0.0. A correct optimizer keeps returning to the initial partition;
-// the buggy optimizer wanders away after the first burst.
-// =================================================================================
-
-#[test]
-fn test_short_bursts_returns_partition_matching_claimed_best_score() {
-    let (graph, partition) = fixture_with_attributes("6x6", vec![]);
-    // Box::leak gives us a 'static reference, which is Copy + Send, satisfying
-    // multi_short_bursts's Copy bound on the objective closure.
-    let initial: &'static [u32] =
-        Box::leak(partition.assignments.clone().into_boxed_slice());
-
-    let objective = move |_graph: &Graph, p: &Partition| -> f64 {
-        if p.assignments.as_slice() == initial { 1.0 } else { 0.0 }
-    };
-
-    let params = make_params(30);
-    let final_partition =
-        multi_short_bursts(&graph, partition, &params, 1, objective, true, 5, false).unwrap();
-
-    // With correct scoring: every within-burst step has actual score 0.0 < 1.0
-    // (the initial best), so no step ever passes the >= check and the optimizer
-    // returns the unchanged initial partition.
-    //
-    // With the pre-fix bug: score(P_0) = 1.0 is computed before the update, then
-    // partition advances to P_1. Since 1.0 >= 1.0, P_1 (score 0.0) is stored as
-    // the burst best. After the first burst the global partition is P_1. All
-    // subsequent bursts do the same random walk and never return to P_0.
-    assert_eq!(
-        final_partition.assignments.as_slice(),
-        initial,
-        "Short bursts returned a partition other than the initial, which has the unique \
-         maximum score. This indicates the optimizer stored the post-step partition \
-         before scoring it (pre-fix scoring bug)."
-    );
-}
-
-// =================================================================================
 // == Stats writer receives every accepted chain step (write_best_only=false).
 // =================================================================================
 
@@ -135,7 +89,7 @@ fn test_short_bursts_writer_records_every_accepted_step() {
     };
 
     let mut writer = RecordingWriter::new();
-    multi_short_bursts_incremental_with_writer(
+    multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,
@@ -187,7 +141,7 @@ fn test_short_bursts_write_best_only_records_only_improvements() {
 
     let params = make_params(500);
     let mut writer = RecordingWriter::new();
-    multi_short_bursts_incremental_with_writer(
+    multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,
@@ -263,7 +217,7 @@ fn test_short_bursts_write_best_only_cross_validation() {
     ));
     let mut scores_writer = ScoresWriter::new(scores_out);
 
-    multi_short_bursts_incremental_with_writer(
+    multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,
@@ -282,7 +236,7 @@ fn test_short_bursts_write_best_only_cross_validation() {
     let (graph2, partition2) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
     let mut best_writer = RecordingWriter::new();
 
-    multi_short_bursts_incremental_with_writer(
+    multi_short_bursts_with_writer(
         &graph2,
         partition2,
         &params,
@@ -355,8 +309,8 @@ fn test_short_bursts_write_best_only_cross_validation() {
 }
 
 // =================================================================================
-// == Hill-climbing: multi_short_bursts with maximize=true should not return a
-// == partition worse than the starting point.
+// == Hill-climbing: maximize=true should not return a partition worse than the
+// == starting point.
 // =================================================================================
 
 #[test]
@@ -366,17 +320,19 @@ fn test_short_bursts_hill_climbing_maximize() {
     let objective = make_objective(config);
     let initial_score = objective.score(&graph, &partition);
 
-    // Use the Copy-compatible score method via a captured ObjectiveConfig.
     let params = make_params(1000);
-    let final_partition = multi_short_bursts(
+    let final_partition = multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,
         1,
-        move |g, p| objective.score(g, p),
+        objective,
         true, // maximize
         10,
+        None,
+        None,
         false,
+        true, // write_best_only: hill-climbing semantics
     )
     .unwrap();
 

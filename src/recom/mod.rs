@@ -5,8 +5,8 @@ use crate::partition::Partition;
 use rand::rngs::SmallRng;
 use rand::Rng;
 
-/// ReCom-based optimization.
-pub mod opt;
+/// ReCom-based short-bursts optimizer.
+pub mod short_bursts;
 /// ReCom batch size autotuning.
 //mod autotune;
 /// ReCom runners.
