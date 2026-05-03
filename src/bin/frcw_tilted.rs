@@ -10,7 +10,9 @@ use frcw::objectives::{
     ensure_derived_perim_column, make_objective, partial_node_cols, polsby_popper_autoderive,
     required_edge_cols, required_node_cols,
 };
-use frcw::recom::tilted::multi_tilted_runs_incremental_with_writer;
+use frcw::recom::tilted::{
+    multi_tilted_runs_incremental_with_writer, FixedAcceptance, MetropolisAcceptance,
+};
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{
     AssignmentsOnlyWriter, BenWriter, CanonicalWriter, JSONLWriter, PcompressWriter, ScoresWriter,
@@ -132,13 +134,38 @@ fn main() {
                 .help("Number of worker threads for parallel tree drawing."),
         )
         .arg(
+            Arg::new("accept_rule")
+                .long("accept-rule")
+                .required(false)
+                .value_parser(["fixed", "metropolis"])
+                .default_value("fixed")
+                .help(
+                    "Acceptance rule for proposals with a worse score. \
+                    'fixed' accepts with constant probability '--accept-worse-prob'. \
+                    'metropolis' accepts with probability exp(beta * delta) using \
+                    '--metropolis-beta'.",
+                ),
+        )
+        .arg(
             Arg::new("accept_worse_prob")
                 .long("accept-worse-prob")
-                .required(true)
+                .required(false)
                 .value_parser(value_parser!(f64))
                 .help(
-                    "Probability of accepting a proposal with a worse score. \
-                    Must be in [0, 1]. Use 0.0 for pure hill-climbing, 1.0 for a random walk.",
+                    "Probability of accepting a proposal with a worse score under \
+                    '--accept-rule fixed'. Must be in [0, 1]. Use 0.0 for pure \
+                    hill-climbing, 1.0 for a random walk.",
+                ),
+        )
+        .arg(
+            Arg::new("metropolis_beta")
+                .long("metropolis-beta")
+                .required(false)
+                .value_parser(value_parser!(f64))
+                .help(
+                    "Inverse temperature for '--accept-rule metropolis'. Must be \
+                    non-negative. 0.0 reduces to a random walk; larger values are \
+                    pickier about how much worse a proposal can be.",
                 ),
         )
         .arg(
@@ -267,9 +294,12 @@ fn main() {
         .get_one::<u64>("rng_seed")
         .expect("rng_seed is required");
     let tol = *matches.get_one::<f64>("tol").expect("tol is required");
-    let accept_worse_prob = *matches
-        .get_one::<f64>("accept_worse_prob")
-        .expect("accept_worse_prob is required");
+    let accept_rule_str = matches
+        .get_one::<String>("accept_rule")
+        .expect("accept_rule has a default value")
+        .as_str();
+    let accept_worse_prob = matches.get_one::<f64>("accept_worse_prob").copied();
+    let metropolis_beta = matches.get_one::<f64>("metropolis_beta").copied();
 
     let maximize = *matches
         .get_one::<bool>("maximize")
@@ -322,9 +352,41 @@ fn main() {
     if n_threads == 0 {
         panic!("Parameter error: '--n-threads' must be at least 1.");
     }
-    if accept_worse_prob < 0.0 || accept_worse_prob > 1.0 {
-        panic!("Parameter error: '--accept-worse-prob' must be between 0 and 1.");
+    enum AcceptanceConfig {
+        Fixed(FixedAcceptance),
+        Metropolis(MetropolisAcceptance),
     }
+    let accept_config = match accept_rule_str {
+        "fixed" => {
+            let prob = accept_worse_prob.expect(
+                "Parameter error: '--accept-worse-prob' is required when '--accept-rule' is 'fixed'.",
+            );
+            if prob < 0.0 || prob > 1.0 {
+                panic!("Parameter error: '--accept-worse-prob' must be between 0 and 1.");
+            }
+            if metropolis_beta.is_some() {
+                panic!(
+                    "Parameter error: '--metropolis-beta' is only valid with '--accept-rule metropolis'."
+                );
+            }
+            AcceptanceConfig::Fixed(FixedAcceptance { prob })
+        }
+        "metropolis" => {
+            let beta = metropolis_beta.expect(
+                "Parameter error: '--metropolis-beta' is required when '--accept-rule' is 'metropolis'.",
+            );
+            if !beta.is_finite() || beta < 0.0 {
+                panic!("Parameter error: '--metropolis-beta' must be a finite non-negative number.");
+            }
+            if accept_worse_prob.is_some() {
+                panic!(
+                    "Parameter error: '--accept-worse-prob' is only valid with '--accept-rule fixed'."
+                );
+            }
+            AcceptanceConfig::Metropolis(MetropolisAcceptance { beta })
+        }
+        other => panic!("Parameter error: unknown acceptance rule '{other}'."),
+    };
 
     let graph_path = matches
         .get_one::<String>("graph_json")
@@ -472,7 +534,9 @@ fn main() {
         "num_threads": n_threads,
         "num_steps": n_steps,
         "type": "tilted_run",
+        "accept_rule": accept_rule_str,
         "accept_worse_prob": accept_worse_prob,
+        "metropolis_beta": metropolis_beta,
         "maximize": maximize,
         "overwrite_output": overwrite_output,
         "show_progress": show_progress,
@@ -525,20 +589,36 @@ fn main() {
         .get_one::<String>("scores-output-file")
         .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
-    let output = multi_tilted_runs_incremental_with_writer(
-        &graph,
-        partition,
-        &params,
-        n_threads,
-        objective,
-        accept_worse_prob,
-        maximize,
-        stats_writer
-            .as_mut()
-            .map(|writer| &mut **writer as &mut dyn StatsWriter),
-        scores_writer.as_mut(),
-        show_progress,
-    );
+    let output = match accept_config {
+        AcceptanceConfig::Fixed(rule) => multi_tilted_runs_incremental_with_writer(
+            &graph,
+            partition,
+            &params,
+            n_threads,
+            objective,
+            rule,
+            maximize,
+            stats_writer
+                .as_mut()
+                .map(|writer| &mut **writer as &mut dyn StatsWriter),
+            scores_writer.as_mut(),
+            show_progress,
+        ),
+        AcceptanceConfig::Metropolis(rule) => multi_tilted_runs_incremental_with_writer(
+            &graph,
+            partition,
+            &params,
+            n_threads,
+            objective,
+            rule,
+            maximize,
+            stats_writer
+                .as_mut()
+                .map(|writer| &mut **writer as &mut dyn StatsWriter),
+            scores_writer.as_mut(),
+            show_progress,
+        ),
+    };
 
     match output {
         Ok(_) => {}

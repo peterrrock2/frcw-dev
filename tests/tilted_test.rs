@@ -2,7 +2,10 @@
 use frcw::graph::Graph;
 use frcw::objectives::{make_objective_fn, required_node_cols};
 use frcw::partition::Partition;
-use frcw::recom::tilted::{multi_tilted_runs, multi_tilted_runs_with_writer};
+use frcw::recom::tilted::{
+    multi_tilted_runs, multi_tilted_runs_with_writer, AcceptanceRule, FixedAcceptance,
+    MetropolisAcceptance,
+};
 use frcw::recom::RecomProposal;
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{CanonicalWriter, ScoresWriter, SelfLoopCounts, StatsWriter};
@@ -179,7 +182,9 @@ fn test_tilted_partition_valid_grid(
         &params,
         n_threads,
         dist0_pop_objective,
-        accept_worse_prob,
+        FixedAcceptance {
+            prob: accept_worse_prob,
+        },
         maximize,
         false,
     );
@@ -210,7 +215,7 @@ fn test_tilted_hill_climbing_maximize_grid() {
         &params,
         1,
         dist0_pop_objective,
-        0.0, // pure hill-climbing
+        FixedAcceptance { prob: 0.0 }, // pure hill-climbing
         true,
         false,
     )
@@ -243,7 +248,7 @@ fn test_tilted_hill_climbing_minimize_grid() {
         &params,
         1,
         dist0_pop_objective,
-        0.0, // pure hill-climbing
+        FixedAcceptance { prob: 0.0 }, // pure hill-climbing
         false,
         false,
     )
@@ -275,7 +280,7 @@ fn test_tilted_rejects_zero_threads() {
         &params,
         0,
         dist0_pop_objective,
-        0.0,
+        FixedAcceptance { prob: 0.0 },
         true,
         false,
     )
@@ -304,8 +309,17 @@ fn test_tilted_returns_terminal_partition_not_best_seen() {
         variant: RecomVariant::DistrictPairsRMST,
         region_weights: None,
     };
-    let final_partition =
-        multi_tilted_runs(&graph, partition, &params, 1, objective, 1.0, true, false).unwrap();
+    let final_partition = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        1,
+        objective,
+        FixedAcceptance { prob: 1.0 },
+        true,
+        false,
+    )
+    .unwrap();
     assert_ne!(
         final_partition.assignments, initial_assignments,
         "tilted runs should return the terminal chain state, not the best-seen plan"
@@ -331,7 +345,7 @@ fn test_tilted_stats_writer_records_accepted_steps() {
         &params,
         1,
         dist0_pop_objective,
-        1.0,
+        FixedAcceptance { prob: 1.0 },
         true,
         Some(&mut stats_writer),
         None,
@@ -372,7 +386,7 @@ fn test_tilted_scores_writer_records_every_step() {
         &params,
         1,
         dist0_pop_objective,
-        0.0,
+        FixedAcceptance { prob: 0.0 },
         true,
         None,
         Some(&mut scores_writer),
@@ -431,7 +445,9 @@ fn test_tilted_canonical_writer_mixed_ending_counts(
         &params,
         n_threads,
         dist0_pop_objective,
-        accept_worse_prob,
+        FixedAcceptance {
+            prob: accept_worse_prob,
+        },
         true,
         Some(&mut writer),
         None,
@@ -509,7 +525,7 @@ fn test_tilted_canonical_writer_flushes_terminal_self_loops() {
         &params,
         1,
         objective,
-        0.0,
+        FixedAcceptance { prob: 0.0 },
         true,
         Some(&mut writer),
         None,
@@ -622,7 +638,14 @@ fn test_tilted_iowa_election_wins(
     let config = r#"{"objective":"election_wins","elections":[{"votes_a":"PRES16D","votes_b":"PRES16R"}],"target":"a","aggregation":"mean"}"#;
     let obj_fn = make_objective_fn(config);
     let final_partition = multi_tilted_runs(
-        &graph, partition, &params, n_threads, obj_fn, 0.05, maximize, false,
+        &graph,
+        partition,
+        &params,
+        n_threads,
+        obj_fn,
+        FixedAcceptance { prob: 0.05 },
+        maximize,
+        false,
     )
     .expect("IA tilted run should not fail");
     assert_partition_valid(&graph, &final_partition, min_pop, max_pop);
@@ -648,8 +671,17 @@ fn test_tilted_iowa_hill_climbing_maximize() {
     let config = r#"{"objective":"election_wins","elections":[{"votes_a":"PRES16D","votes_b":"PRES16R"}],"target":"a","aggregation":"mean"}"#;
     let obj_fn = make_objective_fn(config);
     let initial_score = obj_fn(&graph, &partition);
-    let final_partition =
-        multi_tilted_runs(&graph, partition, &params, 1, obj_fn, 0.0, true, false).unwrap();
+    let final_partition = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        1,
+        obj_fn,
+        FixedAcceptance { prob: 0.0 },
+        true,
+        false,
+    )
+    .unwrap();
     let final_score = obj_fn(&graph, &final_partition);
     assert!(
         final_score >= initial_score,
@@ -683,7 +715,14 @@ fn test_tilted_virginia_election_wins(#[values(1, 4)] n_threads: usize) {
     let config = r#"{"objective":"election_wins","elections":[{"votes_a":"G18DSEN","votes_b":"G18RSEN"}],"target":"a","aggregation":"mean"}"#;
     let obj_fn = make_objective_fn(config);
     let final_partition = multi_tilted_runs(
-        &graph, partition, &params, n_threads, obj_fn, 0.05, true, false,
+        &graph,
+        partition,
+        &params,
+        n_threads,
+        obj_fn,
+        FixedAcceptance { prob: 0.05 },
+        true,
+        false,
     )
     .expect("VA tilted run should not fail");
     assert_partition_valid(&graph, &final_partition, min_pop, max_pop);
@@ -709,8 +748,133 @@ fn test_tilted_virginia_multi_election() {
     };
     let config = r#"{"objective":"election_wins","elections":[{"votes_a":"G18DSEN","votes_b":"G18RSEN"},{"votes_a":"G16DPRS","votes_b":"G16RPRS"}],"target":"a","aggregation":"mean"}"#;
     let obj_fn = make_objective_fn(config);
-    let final_partition =
-        multi_tilted_runs(&graph, partition, &params, 2, obj_fn, 0.05, true, false)
-            .expect("VA multi-election tilted run should not fail");
+    let final_partition = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        2,
+        obj_fn,
+        FixedAcceptance { prob: 0.05 },
+        true,
+        false,
+    )
+    .expect("VA multi-election tilted run should not fail");
+    assert_partition_valid(&graph, &final_partition, min_pop, max_pop);
+}
+
+// ===========================================
+// == Metropolis acceptance rule unit tests ==
+// ===========================================
+
+#[test]
+fn test_metropolis_accepts_improvements_via_engine_invariant() {
+    // The engine never calls accept_worse on a strictly improving proposal,
+    // so this test exercises the rule's behavior when delta < 0 only.
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+    let rule = MetropolisAcceptance { beta: 1.0 };
+    let mut rng = SmallRng::seed_from_u64(42);
+    // current=0.0, proposed=-1.0, maximize=true -> delta = -1.0
+    // exp(-1.0) ~= 0.3679; just confirm we can call without panicking and the
+    // empirical rate over many trials lands close to the analytic value.
+    let trials = 20_000;
+    let accepts = (0..trials)
+        .filter(|_| rule.accept_worse(0.0, -1.0, true, &mut rng))
+        .count();
+    let rate = accepts as f64 / trials as f64;
+    let expected = (-1.0_f64).exp();
+    assert!(
+        (rate - expected).abs() < 0.02,
+        "metropolis empirical rate {} too far from exp(-1) = {}",
+        rate,
+        expected,
+    );
+}
+
+#[rstest]
+fn test_metropolis_acceptance_rate_decays_with_delta(
+    #[values(true, false)] maximize: bool,
+) {
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+    let rule = MetropolisAcceptance { beta: 1.5 };
+    let trials = 30_000;
+    // Worse-proposal magnitudes (interpreted in the optimization direction).
+    let magnitudes = [0.1, 0.5, 1.0, 2.0];
+    let mut rates = Vec::with_capacity(magnitudes.len());
+    for (i, mag) in magnitudes.iter().enumerate() {
+        let (current, proposed) = if maximize {
+            (0.0, -mag)
+        } else {
+            (0.0, *mag)
+        };
+        let mut rng = SmallRng::seed_from_u64(2026 + i as u64);
+        let accepts = (0..trials)
+            .filter(|_| rule.accept_worse(current, proposed, maximize, &mut rng))
+            .count();
+        let rate = accepts as f64 / trials as f64;
+        let expected = (-rule.beta * mag).exp();
+        assert!(
+            (rate - expected).abs() < 0.02,
+            "rate {} far from exp(-beta * {}) = {} (maximize={})",
+            rate,
+            mag,
+            expected,
+            maximize,
+        );
+        rates.push(rate);
+    }
+    for window in rates.windows(2) {
+        assert!(
+            window[0] > window[1],
+            "metropolis acceptance rate should decrease with worsening delta: {:?}",
+            rates,
+        );
+    }
+}
+
+#[test]
+fn test_metropolis_zero_beta_accepts_everything() {
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+    let rule = MetropolisAcceptance { beta: 0.0 };
+    let mut rng = SmallRng::seed_from_u64(7);
+    // exp(0 * delta) = 1, so accept_worse must return true for any worse
+    // proposal regardless of how bad it is.
+    for _ in 0..1_000 {
+        assert!(rule.accept_worse(0.0, -1e6, true, &mut rng));
+        assert!(rule.accept_worse(0.0, 1e6, false, &mut rng));
+    }
+}
+
+#[rstest]
+fn test_tilted_metropolis_partition_valid_grid(
+    #[values(1, 4)] n_threads: usize,
+    #[values(true, false)] maximize: bool,
+    #[values(0.5, 5.0)] beta: f64,
+) {
+    let (graph, partition) = fixture_with_attributes("6x6", vec!["a_share", "b_share"]);
+    let min_pop: u32 = 5;
+    let max_pop: u32 = 7;
+    let params = RecomParams {
+        min_pop,
+        max_pop,
+        num_steps: 500,
+        rng_seed: RNG_SEED,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let final_partition = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        n_threads,
+        dist0_pop_objective,
+        MetropolisAcceptance { beta },
+        maximize,
+        false,
+    )
+    .expect("metropolis tilted run should not fail");
     assert_partition_valid(&graph, &final_partition, min_pop, max_pop);
 }

@@ -1,9 +1,13 @@
-//! ReCom-based optimization using tilted runs.
+//! Shared engine for tilted-run ReCom optimizers.
 //!
 //! A tilted run is a continuous Markov chain that always accepts plans with
-//! better scores and accepts plans with worse scores with a fixed probability
-//! `accept_worse_prob`. Unlike short bursts, there is no burst boundary and
-//! no resetting to a global best state.
+//! better scores and accepts plans with worse scores according to a pluggable
+//! [`AcceptanceRule`]. The two acceptance rules currently provided live in
+//! sibling modules: `fixed::FixedAcceptance` accepts a worse plan with a fixed
+//! probability, and `metropolis::MetropolisAcceptance` accepts a worse plan
+//! with probability `exp(beta * delta)` where `delta` is signed by the
+//! optimization direction. Unlike short bursts, there is no burst boundary
+//! and no resetting to a global best state.
 //!
 //! Threading follows the same model as `multi_chain` in `run.rs`: worker
 //! threads parallelize the tree-drawing step within a single sequential
@@ -14,7 +18,7 @@
 //! engages if a writer falls persistently behind the chain.
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
-use super::{
+use super::super::{
     cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
     RecomVariant,
 };
@@ -36,6 +40,28 @@ const WRITER_CHANNEL_CAPACITY: usize = 128;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+
+/// Decides whether to accept a proposal that does not improve the current score.
+///
+/// Implementors carry the parameters of a particular acceptance rule (for
+/// example a fixed probability, or an inverse temperature). The trait is
+/// `Copy` so each worker thread holds its own value without coordination.
+pub trait AcceptanceRule: Send + Copy {
+    /// Returns `true` to accept a worse-or-equal proposal, `false` to reject.
+    ///
+    /// `current` is the score of the current chain state and `proposed` is the
+    /// score of the candidate. `maximize` is `true` when larger scores are
+    /// improvements. Implementors may consult `rng` for stochastic decisions.
+    /// This method is only called when the proposal is not strictly an
+    /// improvement; strict improvements are always accepted by the engine.
+    fn accept_worse(
+        &self,
+        current: f64,
+        proposed: f64,
+        maximize: bool,
+        rng: &mut SmallRng,
+    ) -> bool;
+}
 
 /// A unit of work sent from the main thread to a worker.
 struct TiltedJobPacket {
@@ -365,164 +391,6 @@ fn save_revert(partition: &Partition, proposal: &RecomProposal, revert: &mut Rec
         .extend_from_slice(&partition.dist_nodes[proposal.b_label]);
 }
 
-/// Draws one valid proposal attempt for a worker round and returns accept/reject output.
-///
-/// Invalid non-reversible proposal attempts (non-adjacent district pair, disconnected
-/// merged pair, no balanced split) are retried internally and do not count as chain
-/// self-loops. A tilted rejection does count as one self-loop.
-///
-/// # Arguments
-///
-/// * `graph` - Full graph associated with `partition`.
-/// * `partition` - Worker-local partition state, temporarily updated and reverted.
-/// * `params` - ReCom parameters used to generate splits.
-/// * `buffers` - Reusable worker buffers for subgraphs, splits, proposals, and reverts.
-/// * `st_sampler` - Spanning-tree sampler for the selected ReCom variant.
-/// * `region_aware_attrs` - Optional node-attribute columns needed by region-aware sampling.
-/// * `obj_fn` - Objective function used to score candidate proposals.
-/// * `current_score` - Objective score of the canonical chain state.
-/// * `accept_worse_prob` - Probability of accepting a non-improving proposal.
-/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `rng` - Worker RNG used for proposal generation and acceptance.
-///
-/// # Returns
-///
-/// A `TiltedResultPacket` containing either one accepted scored proposal or one
-/// tilted rejection self-loop.
-fn draw_tilted_result(
-    graph: &Graph,
-    partition: &mut Partition,
-    params: &RecomParams,
-    buffers: &mut TiltedWorkerBuffers,
-    st_sampler: &mut Box<dyn SpanningTreeSampler>,
-    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
-    current_score: f64,
-    accept_worse_prob: f64,
-    maximize: bool,
-    rng: &mut SmallRng,
-) -> TiltedResultPacket {
-    loop {
-        let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
-        else {
-            continue; // retry (non-reversible)
-        };
-
-        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
-
-        if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
-            continue; // retry (non-reversible)
-        }
-
-        st_sampler.random_spanning_tree_with_parent(
-            &buffers.subgraph.graph,
-            graph,
-            &buffers.subgraph.raw_nodes,
-            &mut buffers.spanning_tree,
-            rng,
-        );
-        let split = random_split(
-            &buffers.subgraph.graph,
-            graph,
-            rng,
-            &buffers.spanning_tree.st,
-            dist_a,
-            dist_b,
-            &mut buffers.split,
-            &mut buffers.proposal,
-            &buffers.subgraph.raw_nodes,
-            params,
-        );
-        if split.is_err() {
-            continue; // retry (non-reversible)
-        }
-
-        save_revert(partition, &buffers.proposal, &mut buffers.revert);
-        partition.update(&buffers.proposal);
-        let new_score = obj_fn(graph, partition);
-        partition.update(&buffers.revert);
-
-        let is_improvement = if maximize {
-            new_score >= current_score
-        } else {
-            new_score <= current_score
-        };
-        if is_improvement || rng.random::<f64>() < accept_worse_prob {
-            return TiltedResultPacket {
-                rejections: 0,
-                proposals: vec![ScoredProposal {
-                    id: rng.random::<u64>(),
-                    proposal: buffers.proposal.clone(),
-                    score: new_score,
-                }],
-            };
-        }
-
-        return TiltedResultPacket {
-            rejections: 1,
-            proposals: Vec::new(),
-        };
-    }
-}
-
-/// Starts a tilted-run worker thread.
-///
-/// Each round, the worker draws one spanning tree, produces a proposal,
-/// temporarily applies it to score, always reverts, then decides accept/reject
-/// using the tilted criterion. Results are sent back to the main thread.
-///
-/// # Arguments
-///
-/// * `graph` - Worker-owned graph clone.
-/// * `partition` - Worker-owned partition clone kept in sync from main-thread diffs.
-/// * `params` - ReCom parameters.
-/// * `obj_fn` - Objective function used to score candidate proposals.
-/// * `accept_worse_prob` - Probability of accepting a non-improving proposal.
-/// * `maximize` - If true, larger scores are improvements; otherwise smaller scores are.
-/// * `rng_seed` - Seed for this worker's RNG.
-/// * `buf_size` - Capacity for two-district subgraph/proposal buffers.
-/// * `job_recv` - Channel receiving canonical-state updates from the main thread.
-/// * `result_send` - Channel sending worker accept/reject results to the main thread.
-fn start_tilted_worker(
-    graph: &Graph,
-    mut partition: Partition,
-    params: RecomParams,
-    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
-    accept_worse_prob: f64,
-    maximize: bool,
-    rng_seed: u64,
-    buf_size: usize,
-    job_recv: Receiver<TiltedJobPacket>,
-    result_send: Sender<TiltedResultPacket>,
-) {
-    let n = graph.pops.len();
-    let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
-    let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
-    let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
-
-    let mut next: TiltedJobPacket = job_recv.recv().unwrap();
-    while !next.terminate {
-        if let Some(diff) = next.diff {
-            partition.update(&diff);
-        }
-
-        let result = draw_tilted_result(
-            graph,
-            &mut partition,
-            &params,
-            &mut buffers,
-            &mut st_sampler,
-            obj_fn,
-            next.current_score,
-            accept_worse_prob,
-            maximize,
-            &mut rng,
-        );
-
-        result_send.send(result).unwrap();
-        next = job_recv.recv().unwrap();
-    }
-}
-
 /// Starts a chain-statistics writer thread.
 ///
 /// # Arguments
@@ -554,7 +422,6 @@ fn start_tilted_stats_writer(
     }
     writer.close().unwrap();
 }
-
 /// Starts a score writer thread.
 ///
 /// # Arguments
@@ -573,7 +440,9 @@ fn start_tilted_score_writer(
     initial_district_scores: Vec<f64>,
     recv: Receiver<TiltedScorePacket>,
 ) {
-    writer.init(initial_score, &initial_district_scores).unwrap();
+    writer
+        .init(initial_score, &initial_district_scores)
+        .unwrap();
     let mut last_districts = initial_district_scores;
     let mut next = recv.recv().unwrap();
     while !next.terminate {
@@ -753,12 +622,130 @@ fn run_tilted_main_loop(
     }
 }
 
+/// Draws one round of tilted output for a closure-scoring worker.
+fn draw_tilted_result<R: AcceptanceRule>(
+    graph: &Graph,
+    partition: &mut Partition,
+    params: &RecomParams,
+    buffers: &mut TiltedWorkerBuffers,
+    st_sampler: &mut Box<dyn SpanningTreeSampler>,
+    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
+    current_score: f64,
+    rule: R,
+    maximize: bool,
+    rng: &mut SmallRng,
+) -> TiltedResultPacket {
+    loop {
+        let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
+        else {
+            continue;
+        };
+
+        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
+
+        if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
+            continue;
+        }
+
+        st_sampler.random_spanning_tree_with_parent(
+            &buffers.subgraph.graph,
+            graph,
+            &buffers.subgraph.raw_nodes,
+            &mut buffers.spanning_tree,
+            rng,
+        );
+        let split = random_split(
+            &buffers.subgraph.graph,
+            graph,
+            rng,
+            &buffers.spanning_tree.st,
+            dist_a,
+            dist_b,
+            &mut buffers.split,
+            &mut buffers.proposal,
+            &buffers.subgraph.raw_nodes,
+            params,
+        );
+        if split.is_err() {
+            continue;
+        }
+
+        save_revert(partition, &buffers.proposal, &mut buffers.revert);
+        partition.update(&buffers.proposal);
+        let new_score = obj_fn(graph, partition);
+        partition.update(&buffers.revert);
+
+        let is_improvement = if maximize {
+            new_score >= current_score
+        } else {
+            new_score <= current_score
+        };
+        if is_improvement || rule.accept_worse(current_score, new_score, maximize, rng) {
+            return TiltedResultPacket {
+                rejections: 0,
+                proposals: vec![ScoredProposal {
+                    id: rng.random::<u64>(),
+                    proposal: buffers.proposal.clone(),
+                    score: new_score,
+                }],
+            };
+        }
+
+        return TiltedResultPacket {
+            rejections: 1,
+            proposals: Vec::new(),
+        };
+    }
+}
+
+/// Starts a closure-scoring tilted worker thread.
+fn start_tilted_worker<R: AcceptanceRule>(
+    graph: &Graph,
+    mut partition: Partition,
+    params: RecomParams,
+    obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
+    rule: R,
+    maximize: bool,
+    rng_seed: u64,
+    buf_size: usize,
+    job_recv: Receiver<TiltedJobPacket>,
+    result_send: Sender<TiltedResultPacket>,
+) {
+    let n = graph.pops.len();
+    let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
+    let mut buffers = TiltedWorkerBuffers::new(n, buf_size, params.balance_ub);
+    let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
+
+    let mut next: TiltedJobPacket = job_recv.recv().unwrap();
+    while !next.terminate {
+        if let Some(diff) = next.diff {
+            partition.update(&diff);
+        }
+
+        let result = draw_tilted_result(
+            graph,
+            &mut partition,
+            &params,
+            &mut buffers,
+            &mut st_sampler,
+            obj_fn,
+            next.current_score,
+            rule,
+            maximize,
+            &mut rng,
+        );
+
+        result_send.send(result).unwrap();
+        next = job_recv.recv().unwrap();
+    }
+}
+
 /// Runs a tilted-run optimizer with parallel tree drawing.
 ///
-/// Worker threads draw spanning trees in parallel from the same partition state.
-/// Each worker scores its proposal and decides accept/reject using the tilted
-/// criterion. The main thread interleaves accepted proposals and rejections
-/// (exactly like `multi_chain` in `run.rs`), maintaining a single sequential chain.
+/// Worker threads draw spanning trees in parallel from the same partition state,
+/// score each proposal via `obj_fn`, and decide accept/reject with `rule`. The
+/// main thread interleaves accepted proposals and rejections (exactly like
+/// `multi_chain` in `run.rs`), maintaining a single sequential chain.
 ///
 /// # Arguments
 ///
@@ -768,24 +755,19 @@ fn run_tilted_main_loop(
 ///   of chain steps (accepted + rejected).
 /// * `n_threads` - The number of worker threads for parallel tree drawing.
 /// * `obj_fn` - The objective function.
-/// * `accept_worse_prob` - Probability of accepting a proposal with a worse score.
+/// * `rule` - The acceptance rule applied to non-improving proposals.
 /// * `maximize` - If true, higher scores are better. If false, lower scores are better.
 /// * `stats_writer` - Optional asynchronous writer for accepted chain proposals
 ///   and self-loop counts.
 /// * `score_writer` - Optional asynchronous writer for per-step objective scores.
 /// * `show_progress` - If true, show a progress bar tracking total chain steps.
-///
-/// # Returns
-///
-/// `Ok(partition)` containing the terminal chain state, or `Err` if inputs are
-/// invalid or a scoped worker panics.
-pub fn multi_tilted_runs_with_writer(
+pub fn multi_tilted_runs_with_writer<R: AcceptanceRule>(
     graph: &Graph,
     partition: Partition,
     params: &RecomParams,
     n_threads: usize,
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     stats_writer: Option<&mut dyn StatsWriter>,
     score_writer: Option<&mut ScoresWriter>,
@@ -842,15 +824,13 @@ pub fn multi_tilted_runs_with_writer(
         let score_send = if let Some(writer) = score_writer {
             let (send, recv): (Sender<TiltedScorePacket>, Receiver<TiltedScorePacket>) =
                 bounded(WRITER_CHANNEL_CAPACITY);
-            scope.spawn(move |_| {
-                start_tilted_score_writer(writer, current_score, Vec::new(), recv)
-            });
+            scope
+                .spawn(move |_| start_tilted_score_writer(writer, current_score, Vec::new(), recv));
             Some(send)
         } else {
             None
         };
 
-        // Start worker threads.
         for t_idx in 0..n_threads {
             let rng_seed = params.rng_seed + t_idx as u64 + 1;
             let job_recv = job_recvs[t_idx].clone();
@@ -863,7 +843,7 @@ pub fn multi_tilted_runs_with_writer(
                     partition,
                     params.clone(),
                     obj_fn,
-                    accept_worse_prob,
+                    rule,
                     maximize,
                     rng_seed,
                     node_ub,
@@ -927,13 +907,13 @@ pub fn multi_tilted_runs_with_writer(
 ///
 /// See [`multi_tilted_runs_with_writer`] for the full implementation and argument
 /// documentation.
-pub fn multi_tilted_runs(
+pub fn multi_tilted_runs<R: AcceptanceRule>(
     graph: &Graph,
     partition: Partition,
     params: &RecomParams,
     n_threads: usize,
     obj_fn: impl Fn(&Graph, &Partition) -> f64 + Send + Clone + Copy,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     show_progress: bool,
 ) -> Result<Partition, String> {
@@ -943,7 +923,7 @@ pub fn multi_tilted_runs(
         params,
         n_threads,
         obj_fn,
-        accept_worse_prob,
+        rule,
         maximize,
         None,
         None,
@@ -955,15 +935,11 @@ pub fn multi_tilted_runs(
 // Incremental tilted runner
 // =====================================================================
 //
-// The incremental runner mirrors the closure-based runner above, but uses
-// an `IncrementalObjective` to avoid full-district rescoring per candidate.
-//
-// Key differences from the closure runner:
-// - Workers and the main thread each own a cached `ObjectiveState`.
-// - Worker scoring uses `objective.score_proposal(&graph, &state, &proposal)`
-//   without mutating `partition` or `state`.
-// - When a diff is received, both the worker's partition and its state are
-//   updated via `objective.apply_proposal`.
+// Mirrors the closure-based runner above, but uses an `IncrementalObjective`
+// to avoid full-district rescoring per candidate. Workers and the main thread
+// each own a cached `ObjectiveState`; worker scoring queries it directly
+// without mutating `partition` or `state`. When a diff is received, both the
+// worker's partition and its state are updated via `objective.apply_proposal`.
 
 /// Incremental-mode worker buffers (no revert buffer needed).
 struct TiltedWorkerBuffersIncremental {
@@ -1109,19 +1085,22 @@ fn fill_pair_subgraph_incremental(
     partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 }
 
-fn start_tilted_worker_incremental<O: IncrementalObjective>(
+fn start_tilted_worker_incremental<O, R>(
     graph: &Graph,
     mut partition: Partition,
     mut objective_state: O::State,
     params: RecomParams,
     objective: O,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     rng_seed: u64,
     buf_size: usize,
     job_recv: Receiver<TiltedJobPacket>,
     result_send: Sender<TiltedResultPacket>,
-) {
+) where
+    O: IncrementalObjective,
+    R: AcceptanceRule,
+{
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut buffers = TiltedWorkerBuffersIncremental::new(n, buf_size, params.balance_ub);
@@ -1143,7 +1122,7 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
             &objective,
             &objective_state,
             next.current_score,
-            accept_worse_prob,
+            rule,
             maximize,
             &mut rng,
         );
@@ -1156,7 +1135,7 @@ fn start_tilted_worker_incremental<O: IncrementalObjective>(
 /// Draws one tilted result for an incremental worker. Unlike the closure-based
 /// worker, this does not need to apply/revert the proposal to score -- it
 /// queries the incremental objective directly.
-fn draw_tilted_result_incremental<O: IncrementalObjective>(
+fn draw_tilted_result_incremental<O, R>(
     graph: &Graph,
     partition: &mut Partition,
     params: &RecomParams,
@@ -1165,10 +1144,14 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
     objective: &O,
     objective_state: &O::State,
     current_score: f64,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     rng: &mut SmallRng,
-) -> TiltedResultPacket {
+) -> TiltedResultPacket
+where
+    O: IncrementalObjective,
+    R: AcceptanceRule,
+{
     loop {
         let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
         else {
@@ -1211,7 +1194,7 @@ fn draw_tilted_result_incremental<O: IncrementalObjective>(
         } else {
             new_score <= current_score
         };
-        if is_improvement || rng.random::<f64>() < accept_worse_prob {
+        if is_improvement || rule.accept_worse(current_score, new_score, maximize, rng) {
             return TiltedResultPacket {
                 rejections: 0,
                 proposals: vec![ScoredProposal {
@@ -1315,13 +1298,13 @@ fn run_tilted_main_loop_incremental<O, S>(
 /// of rescoring the entire partition on each call. Each worker (and the main
 /// thread) owns a clone of the objective's cached state, updated in lockstep
 /// with the partition whenever a proposal is accepted.
-pub fn multi_tilted_runs_incremental_with_writer<O>(
+pub fn multi_tilted_runs_incremental_with_writer<O, R>(
     graph: &Graph,
     partition: Partition,
     params: &RecomParams,
     n_threads: usize,
     objective: O,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     stats_writer: Option<&mut dyn StatsWriter>,
     score_writer: Option<&mut ScoresWriter>,
@@ -1330,6 +1313,7 @@ pub fn multi_tilted_runs_incremental_with_writer<O>(
 where
     O: IncrementalObjective + Send + Clone + 'static,
     O::State: Send + Clone + 'static,
+    R: AcceptanceRule + 'static,
 {
     if n_threads == 0 {
         return Err("n_threads must be at least 1".to_string());
@@ -1401,13 +1385,13 @@ where
             let worker_obj = objective.clone();
 
             scope.spawn(move |_| {
-                start_tilted_worker_incremental::<O>(
+                start_tilted_worker_incremental::<O, R>(
                     graph,
                     partition,
                     worker_state,
                     params.clone(),
                     worker_obj,
-                    accept_worse_prob,
+                    rule,
                     maximize,
                     rng_seed,
                     node_ub,
@@ -1417,11 +1401,8 @@ where
             });
         }
 
-        let mut state = TiltedMainStateIncremental::<O::State>::new(
-            partition,
-            initial_state,
-            current_score,
-        );
+        let mut state =
+            TiltedMainStateIncremental::<O::State>::new(partition, initial_state, current_score);
         run_tilted_main_loop_incremental(
             graph,
             &objective,
@@ -1469,27 +1450,26 @@ where
 
     match scoped_result {
         Ok(inner) => inner,
-        Err(_panic) => {
-            Err("multi_tilted_runs_incremental panicked in a worker thread".to_string())
-        }
+        Err(_panic) => Err("multi_tilted_runs_incremental panicked in a worker thread".to_string()),
     }
 }
 
 /// Runs the incremental tilted-run optimizer without writing chain statistics
 /// or scores.
-pub fn multi_tilted_runs_incremental<O>(
+pub fn multi_tilted_runs_incremental<O, R>(
     graph: &Graph,
     partition: Partition,
     params: &RecomParams,
     n_threads: usize,
     objective: O,
-    accept_worse_prob: f64,
+    rule: R,
     maximize: bool,
     show_progress: bool,
 ) -> Result<Partition, String>
 where
     O: IncrementalObjective + Send + Clone + 'static,
     O::State: Send + Clone + 'static,
+    R: AcceptanceRule + 'static,
 {
     multi_tilted_runs_incremental_with_writer(
         graph,
@@ -1497,7 +1477,7 @@ where
         params,
         n_threads,
         objective,
-        accept_worse_prob,
+        rule,
         maximize,
         None,
         None,
