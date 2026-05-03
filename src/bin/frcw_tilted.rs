@@ -11,7 +11,7 @@ use frcw::objectives::{
     required_edge_cols, required_node_cols,
 };
 use frcw::recom::tilted::{
-    multi_tilted_runs_incremental_with_writer, FixedAcceptance, MetropolisAcceptance,
+    multi_tilted_runs_with_writer, FixedAcceptance, IncrementalBackend, MetropolisAcceptance,
 };
 use frcw::recom::{RecomParams, RecomVariant};
 use frcw::stats::{
@@ -589,13 +589,14 @@ fn main() {
         .get_one::<String>("scores-output-file")
         .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
+    let backend = IncrementalBackend { objective };
     let output = match accept_config {
-        AcceptanceConfig::Fixed(rule) => multi_tilted_runs_incremental_with_writer(
+        AcceptanceConfig::Fixed(rule) => multi_tilted_runs_with_writer(
             &graph,
             partition,
             &params,
             n_threads,
-            objective,
+            backend,
             rule,
             maximize,
             stats_writer
@@ -604,12 +605,12 @@ fn main() {
             scores_writer.as_mut(),
             show_progress,
         ),
-        AcceptanceConfig::Metropolis(rule) => multi_tilted_runs_incremental_with_writer(
+        AcceptanceConfig::Metropolis(rule) => multi_tilted_runs_with_writer(
             &graph,
             partition,
             &params,
             n_threads,
-            objective,
+            backend,
             rule,
             maximize,
             stats_writer

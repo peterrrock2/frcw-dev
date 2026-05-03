@@ -1,10 +1,10 @@
 // Functional tests for tilted run optimization.
 use frcw::graph::Graph;
-use frcw::objectives::{make_objective_fn, required_node_cols};
+use frcw::objectives::{make_objective, make_objective_fn, required_node_cols};
 use frcw::partition::Partition;
 use frcw::recom::tilted::{
     multi_tilted_runs, multi_tilted_runs_with_writer, AcceptanceRule, FixedAcceptance,
-    MetropolisAcceptance,
+    FullRescoreBackend, IncrementalBackend, MetropolisAcceptance,
 };
 use frcw::recom::RecomProposal;
 use frcw::recom::{RecomParams, RecomVariant};
@@ -181,7 +181,9 @@ fn test_tilted_partition_valid_grid(
         partition,
         &params,
         n_threads,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance {
             prob: accept_worse_prob,
         },
@@ -214,7 +216,9 @@ fn test_tilted_hill_climbing_maximize_grid() {
         partition,
         &params,
         1,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance { prob: 0.0 }, // pure hill-climbing
         true,
         false,
@@ -247,7 +251,9 @@ fn test_tilted_hill_climbing_minimize_grid() {
         partition,
         &params,
         1,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance { prob: 0.0 }, // pure hill-climbing
         false,
         false,
@@ -279,7 +285,9 @@ fn test_tilted_rejects_zero_threads() {
         partition,
         &params,
         0,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance { prob: 0.0 },
         true,
         false,
@@ -314,7 +322,7 @@ fn test_tilted_returns_terminal_partition_not_best_seen() {
         partition,
         &params,
         1,
-        objective,
+        FullRescoreBackend { obj_fn: objective },
         FixedAcceptance { prob: 1.0 },
         true,
         false,
@@ -344,7 +352,9 @@ fn test_tilted_stats_writer_records_accepted_steps() {
         partition,
         &params,
         1,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance { prob: 1.0 },
         true,
         Some(&mut stats_writer),
@@ -385,7 +395,9 @@ fn test_tilted_scores_writer_records_every_step() {
         partition,
         &params,
         1,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance { prob: 0.0 },
         true,
         None,
@@ -444,7 +456,9 @@ fn test_tilted_canonical_writer_mixed_ending_counts(
         partition,
         &params,
         n_threads,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         FixedAcceptance {
             prob: accept_worse_prob,
         },
@@ -524,7 +538,7 @@ fn test_tilted_canonical_writer_flushes_terminal_self_loops() {
         partition,
         &params,
         1,
-        objective,
+        FullRescoreBackend { obj_fn: objective },
         FixedAcceptance { prob: 0.0 },
         true,
         Some(&mut writer),
@@ -642,7 +656,7 @@ fn test_tilted_iowa_election_wins(
         partition,
         &params,
         n_threads,
-        obj_fn,
+        FullRescoreBackend { obj_fn },
         FixedAcceptance { prob: 0.05 },
         maximize,
         false,
@@ -676,7 +690,7 @@ fn test_tilted_iowa_hill_climbing_maximize() {
         partition,
         &params,
         1,
-        obj_fn,
+        FullRescoreBackend { obj_fn },
         FixedAcceptance { prob: 0.0 },
         true,
         false,
@@ -719,7 +733,7 @@ fn test_tilted_virginia_election_wins(#[values(1, 4)] n_threads: usize) {
         partition,
         &params,
         n_threads,
-        obj_fn,
+        FullRescoreBackend { obj_fn },
         FixedAcceptance { prob: 0.05 },
         true,
         false,
@@ -753,7 +767,7 @@ fn test_tilted_virginia_multi_election() {
         partition,
         &params,
         2,
-        obj_fn,
+        FullRescoreBackend { obj_fn },
         FixedAcceptance { prob: 0.05 },
         true,
         false,
@@ -870,11 +884,300 @@ fn test_tilted_metropolis_partition_valid_grid(
         partition,
         &params,
         n_threads,
-        dist0_pop_objective,
+        FullRescoreBackend {
+            obj_fn: dist0_pop_objective,
+        },
         MetropolisAcceptance { beta },
         maximize,
         false,
     )
     .expect("metropolis tilted run should not fail");
     assert_partition_valid(&graph, &final_partition, min_pop, max_pop);
+}
+
+// ===========================================================================
+// == Cross-backend equivalence: FullRescore and Incremental must agree ==
+// ===========================================================================
+//
+// Plumbing the same `ObjectiveConfig` through both backends with the same RNG
+// seed and a single worker thread should produce bit-identical chains.
+// `score_candidate` consumes no RNG bits in either backend, so identical
+// scores at every candidate => identical accept/reject decisions => identical
+// chain trajectories. This catches:
+// - drift between `IncrementalObjective::score_proposal` and a from-scratch
+//   evaluation of the applied partition,
+// - drift in `IncrementalObjective::apply_proposal` across many steps,
+// - any future divergence in how the engine threads `B::State` through
+//   `apply_accepted` between the two backend impls.
+
+const ELECTION_WINS_CONFIG: &str = r#"{"objective":"election_wins","elections":[{"votes_a":"PRES16D","votes_b":"PRES16R"}],"target":"a","aggregation":"mean"}"#;
+
+// Per-objective math equivalence for `gingles_partial` and `polsby_popper`
+// is covered in `src/objectives.rs::tests::*_incremental_matches_full_score`.
+// The IA / VA fixtures don't carry the int-typed columns those objectives
+// need, so the engine-level cross-backend tests below stay on `election_wins`.
+
+#[rstest]
+fn test_backends_agree_on_iowa_election_wins(
+    #[values(true, false)] maximize: bool,
+    #[values(1, 7, 42, 101, 2025)] seed: u64,
+) {
+    let (mut graph, partition) = fixture_with_attributes("IA", vec!["PRES16D", "PRES16R"]);
+    let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+    let pop_tol = 0.2;
+    let min_pop = ((1.0 - pop_tol) * avg_pop).floor() as u32;
+    let max_pop = ((1.0 + pop_tol) * avg_pop).ceil() as u32;
+    let params = RecomParams {
+        min_pop,
+        max_pop,
+        num_steps: 500,
+        rng_seed: seed,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+
+    let obj_fn = make_objective_fn(ELECTION_WINS_CONFIG);
+    let objective = make_objective(ELECTION_WINS_CONFIG);
+    objective.cache_graph_cols(&mut graph);
+
+    let final_full = multi_tilted_runs(
+        &graph,
+        partition.clone(),
+        &params,
+        1,
+        FullRescoreBackend { obj_fn },
+        FixedAcceptance { prob: 0.05 },
+        maximize,
+        false,
+    )
+    .expect("full-rescore run should not fail");
+
+    let final_inc = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        1,
+        IncrementalBackend { objective },
+        FixedAcceptance { prob: 0.05 },
+        maximize,
+        false,
+    )
+    .expect("incremental run should not fail");
+
+    assert_eq!(
+        final_full.assignments, final_inc.assignments,
+        "backends produced different chains (election_wins, maximize={}, seed={})",
+        maximize, seed,
+    );
+}
+
+#[rstest]
+fn test_backends_agree_on_virginia_election_wins(
+    #[values(true, false)] maximize: bool,
+    #[values(1, 42, 2025)] seed: u64,
+) {
+    let (mut graph, partition) = fixture_with_attributes("VA", vec!["G18DSEN", "G18RSEN"]);
+    let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+    let pop_tol = 0.05;
+    let min_pop = ((1.0 - pop_tol) * avg_pop).floor() as u32;
+    let max_pop = ((1.0 + pop_tol) * avg_pop).ceil() as u32;
+    let params = RecomParams {
+        min_pop,
+        max_pop,
+        num_steps: 250,
+        rng_seed: seed,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+    let config = r#"{"objective":"election_wins","elections":[{"votes_a":"G18DSEN","votes_b":"G18RSEN"}],"target":"a","aggregation":"mean"}"#;
+
+    let obj_fn = make_objective_fn(config);
+    let objective = make_objective(config);
+    objective.cache_graph_cols(&mut graph);
+
+    let final_full = multi_tilted_runs(
+        &graph,
+        partition.clone(),
+        &params,
+        1,
+        FullRescoreBackend { obj_fn },
+        FixedAcceptance { prob: 0.1 },
+        maximize,
+        false,
+    )
+    .expect("full-rescore run should not fail");
+
+    let final_inc = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        1,
+        IncrementalBackend { objective },
+        FixedAcceptance { prob: 0.1 },
+        maximize,
+        false,
+    )
+    .expect("incremental run should not fail");
+
+    assert_eq!(
+        final_full.assignments, final_inc.assignments,
+        "backends produced different chains (VA election_wins, maximize={}, seed={})",
+        maximize, seed,
+    );
+}
+
+#[rstest]
+fn test_backends_agree_under_metropolis(
+    #[values(0.5, 5.0)] beta: f64,
+    #[values(7, 2025)] seed: u64,
+) {
+    let (mut graph, partition) = fixture_with_attributes("IA", vec!["PRES16D", "PRES16R"]);
+    let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+    let pop_tol = 0.2;
+    let min_pop = ((1.0 - pop_tol) * avg_pop).floor() as u32;
+    let max_pop = ((1.0 + pop_tol) * avg_pop).ceil() as u32;
+    let params = RecomParams {
+        min_pop,
+        max_pop,
+        num_steps: 500,
+        rng_seed: seed,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+
+    let obj_fn = make_objective_fn(ELECTION_WINS_CONFIG);
+    let objective = make_objective(ELECTION_WINS_CONFIG);
+    objective.cache_graph_cols(&mut graph);
+
+    let final_full = multi_tilted_runs(
+        &graph,
+        partition.clone(),
+        &params,
+        1,
+        FullRescoreBackend { obj_fn },
+        MetropolisAcceptance { beta },
+        true,
+        false,
+    )
+    .expect("full-rescore metropolis run should not fail");
+
+    let final_inc = multi_tilted_runs(
+        &graph,
+        partition,
+        &params,
+        1,
+        IncrementalBackend { objective },
+        MetropolisAcceptance { beta },
+        true,
+        false,
+    )
+    .expect("incremental metropolis run should not fail");
+
+    assert_eq!(
+        final_full.assignments, final_inc.assignments,
+        "backends produced different chains (metropolis, beta={}, seed={})",
+        beta, seed,
+    );
+}
+
+// Deeper check on a single config: assert the per-step score trajectory matches
+// exactly. If the chains agree at every step (not just at the end), the chain
+// trajectories are bit-identical.
+#[test]
+fn test_backends_agree_on_full_score_trajectory() {
+    let (mut graph, partition) = fixture_with_attributes("IA", vec!["PRES16D", "PRES16R"]);
+    let avg_pop = (graph.total_pop as f64) / (partition.num_dists as f64);
+    let pop_tol = 0.2;
+    let min_pop = ((1.0 - pop_tol) * avg_pop).floor() as u32;
+    let max_pop = ((1.0 + pop_tol) * avg_pop).ceil() as u32;
+    let params = RecomParams {
+        min_pop,
+        max_pop,
+        num_steps: 500,
+        rng_seed: 20260503,
+        balance_ub: 0,
+        variant: RecomVariant::DistrictPairsRMST,
+        region_weights: None,
+    };
+
+    let obj_fn = make_objective_fn(ELECTION_WINS_CONFIG);
+    let objective = make_objective(ELECTION_WINS_CONFIG);
+    objective.cache_graph_cols(&mut graph);
+
+    let pid = std::process::id();
+    let path_full =
+        std::env::temp_dir().join(format!("frcw_xback_full_{}.csv", pid));
+    let path_inc =
+        std::env::temp_dir().join(format!("frcw_xback_inc_{}.csv", pid));
+    {
+        let mut full_writer = ScoresWriter::new(Box::new(std::io::BufWriter::new(
+            fs::File::create(&path_full).unwrap(),
+        )));
+        multi_tilted_runs_with_writer(
+            &graph,
+            partition.clone(),
+            &params,
+            1,
+            FullRescoreBackend { obj_fn },
+            FixedAcceptance { prob: 0.05 },
+            true,
+            None,
+            Some(&mut full_writer),
+            false,
+        )
+        .expect("full-rescore run should not fail");
+    }
+    {
+        let mut inc_writer = ScoresWriter::new(Box::new(std::io::BufWriter::new(
+            fs::File::create(&path_inc).unwrap(),
+        )));
+        multi_tilted_runs_with_writer(
+            &graph,
+            partition,
+            &params,
+            1,
+            IncrementalBackend { objective },
+            FixedAcceptance { prob: 0.05 },
+            true,
+            None,
+            Some(&mut inc_writer),
+            false,
+        )
+        .expect("incremental run should not fail");
+    }
+
+    let full_text = fs::read_to_string(&path_full).unwrap();
+    let inc_text = fs::read_to_string(&path_inc).unwrap();
+    let full_lines: Vec<&str> = full_text.lines().collect();
+    let inc_lines: Vec<&str> = inc_text.lines().collect();
+    assert_eq!(
+        full_lines.len(),
+        inc_lines.len(),
+        "score trajectories have different lengths"
+    );
+
+    // Per-step score (column 1) must match exactly. The full-rescore writer
+    // emits no district columns; the incremental writer emits per-district
+    // columns, so we only compare step + score + best_score.
+    for (idx, (full_line, inc_line)) in full_lines.iter().zip(inc_lines.iter()).enumerate() {
+        if idx == 0 {
+            continue; // header
+        }
+        let full_fields: Vec<&str> = full_line.split(',').collect();
+        let inc_fields: Vec<&str> = inc_line.split(',').collect();
+        assert_eq!(
+            &full_fields[..3],
+            &inc_fields[..3],
+            "trajectories diverge at line {}: full={} inc={}",
+            idx,
+            full_line,
+            inc_line,
+        );
+    }
+
+    fs::remove_file(&path_full).unwrap();
+    fs::remove_file(&path_inc).unwrap();
 }

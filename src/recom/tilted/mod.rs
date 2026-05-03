@@ -8,8 +8,8 @@ pub mod fixed;
 pub mod metropolis;
 
 pub use core::{
-    multi_tilted_runs, multi_tilted_runs_incremental, multi_tilted_runs_incremental_with_writer,
-    multi_tilted_runs_with_writer, AcceptanceRule,
+    multi_tilted_runs, multi_tilted_runs_with_writer, AcceptanceRule, FullRescoreBackend,
+    IncrementalBackend, ScoringBackend,
 };
 pub use fixed::FixedAcceptance;
 pub use metropolis::MetropolisAcceptance;
