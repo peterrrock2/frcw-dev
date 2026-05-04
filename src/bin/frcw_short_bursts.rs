@@ -11,7 +11,7 @@ use frcw::objectives::{
     required_edge_cols, required_node_cols,
 };
 use frcw::recom::short_bursts::multi_short_bursts_with_writer;
-use frcw::recom::{RecomParams, RecomVariant};
+use frcw::recom::{IncrementalBackend, RecomParams, RecomVariant};
 use frcw::stats::{
     AssignmentsOnlyWriter, BenWriter, CanonicalWriter, JSONLWriter, PcompressWriter, ScoresWriter,
     StatsWriter, TSVWriter,
@@ -532,12 +532,13 @@ fn main() {
         .get_one::<String>("scores-output-file")
         .map(|path| ScoresWriter::new(output_buffer(path, overwrite_output)));
 
+    let backend = IncrementalBackend { objective };
     let output = multi_short_bursts_with_writer(
         &graph,
         partition,
         &params,
         n_threads,
-        objective,
+        backend,
         maximize,
         burst_length,
         stats_writer

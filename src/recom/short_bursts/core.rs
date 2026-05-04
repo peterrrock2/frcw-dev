@@ -12,9 +12,14 @@
 //! tree-drawing and scoring step, the main thread interleaves their results,
 //! and optional output writers run on separate threads fed by bounded
 //! channels so disk I/O does not block proposal generation.
+//!
+//! Scoring is delegated to a [`ScoringBackend`]. Production runs use
+//! [`crate::recom::IncrementalBackend`] for O(boundary) per-step scoring;
+//! tests and ad-hoc explorations can use [`crate::recom::FullRescoreBackend`]
+//! to plug in arbitrary closure objectives.
 use super::super::{
     cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
-    RecomVariant,
+    RecomVariant, ScoringBackend,
 };
 use super::packets::{
     send_burst_batch, terminate_burst_worker, BurstJobPacket, BurstResult, BurstScorePacket,
@@ -25,7 +30,6 @@ use crate::buffers::{
     graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
 };
 use crate::graph::Graph;
-use crate::objectives::{IncrementalObjective, ObjectiveConfig};
 use crate::partition::Partition;
 use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
 use crate::stats::{ScoresWriter, StatsWriter};
@@ -91,23 +95,26 @@ fn sample_dist_pair(
 /// (or freshly-replaced) partition, optionally collecting every accepted step
 /// into `BurstResult::all_steps`, and always tracks the burst-end best.
 ///
-/// # Arguments
-///
-/// * `collect_trace` - When `true`, every accepted step is stored in
-///   `BurstResult::all_steps`. When `false`, `all_steps` is empty and only
-///   the burst-end best is returned.
-fn run_burst_worker(
+/// When the main thread broadcasts a wholesale partition replacement via
+/// `BurstJobPacket::diff`, the worker re-initializes its backend state from
+/// the new partition: the cached state is no longer valid against the
+/// replaced partition. This is the same swap-handling pattern used by the
+/// tilted runner.
+fn run_burst_worker<B>(
     graph: &Graph,
     mut partition: Partition,
+    mut state: B::State,
     params: RecomParams,
-    obj_fn: impl Fn(&Graph, &Partition) -> ScoreValue + Send,
+    backend: B,
     maximize: bool,
     rng_seed: u64,
     buf_size: usize,
     collect_trace: bool,
     job_recv: Receiver<BurstJobPacket>,
     result_send: Sender<BurstResult>,
-) {
+) where
+    B: ScoringBackend,
+{
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
     let mut subgraph_buf = SubgraphBuffer::new(n, buf_size);
@@ -119,13 +126,14 @@ fn run_burst_worker(
 
     let mut next: BurstJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
-        if next.diff.is_some() {
-            partition = next.diff.unwrap();
+        if let Some(new_partition) = next.diff.take() {
+            partition = new_partition;
+            state = backend.init_state(graph, &partition);
         }
 
         let mut all_steps: Vec<(Partition, ScoreValue)> = Vec::new();
         let mut best: Option<(Partition, ScoreValue)> = None;
-        let mut best_score: ScoreValue = obj_fn(graph, &partition);
+        let mut best_score: ScoreValue = backend.current_score(graph, &partition, &state);
         let mut step = 0;
         while step < next.n_steps {
             let dist_pair = sample_dist_pair(graph, &mut partition, params.variant, &mut rng);
@@ -157,8 +165,8 @@ fn run_burst_worker(
                 &params,
             );
             if split.is_ok() {
-                partition.update(&proposal_buf);
-                let score = obj_fn(graph, &partition);
+                backend.apply_accepted(graph, &mut partition, &mut state, &proposal_buf);
+                let score = backend.current_score(graph, &partition, &state);
                 if collect_trace {
                     all_steps.push((partition.clone(), score));
                 }
@@ -179,9 +187,9 @@ fn run_burst_worker(
 /// Runs a multi-threaded ReCom short-bursts optimizer with optional async
 /// output writers.
 ///
-/// Workers run short ReCom bursts using the full `ObjectiveConfig::score`
-/// path. The main thread maintains per-district cached state via the
-/// incremental interface for use by the optional score writer.
+/// Workers run short ReCom bursts using the scoring path provided by
+/// `backend`. Use [`crate::recom::IncrementalBackend`] for production runs:
+/// per-step scoring drops to O(boundary of two affected districts).
 ///
 /// When `write_best_only = false`, the stats writer thread is called for
 /// every accepted chain step across all worker bursts; sample numbers are
@@ -204,7 +212,7 @@ fn run_burst_worker(
 /// * `partition` - The starting partition.
 /// * `params` - The chain parameters of the ReCom chain runs.
 /// * `n_threads` - The number of worker threads (excluding the main thread).
-/// * `objective` - The incremental objective configuration (`Copy`).
+/// * `backend` - The scoring backend.
 /// * `maximize` - If true, maximize the objective. If false, minimize it.
 /// * `burst_length` - The number of accepted steps per burst per worker.
 /// * `stats_writer` - Optional asynchronous writer called for every step (or
@@ -214,19 +222,22 @@ fn run_burst_worker(
 /// * `show_progress` - If true, display a progress bar to stdout.
 /// * `write_best_only` - If true, the stats writer is called only when a new
 ///   global best is found, and workers skip collecting per-step partitions.
-pub fn multi_short_bursts_with_writer(
+pub fn multi_short_bursts_with_writer<B>(
     graph: &Graph,
     mut partition: Partition,
     params: &RecomParams,
     n_threads: usize,
-    objective: ObjectiveConfig,
+    backend: B,
     maximize: bool,
     burst_length: usize,
     stats_writer: Option<&mut dyn StatsWriter>,
     scores_writer: Option<&mut ScoresWriter>,
     show_progress: bool,
     write_best_only: bool,
-) -> Result<Partition, String> {
+) -> Result<Partition, String>
+where
+    B: ScoringBackend,
+{
     let mut step = 1u64;
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![];
@@ -238,15 +249,11 @@ pub fn multi_short_bursts_with_writer(
     }
     let (result_send, result_recv): (Sender<BurstResult>, Receiver<BurstResult>) = unbounded();
 
-    // Build initial incremental state for writer initialization.
-    let initial_obj_state = objective.init(graph, &partition);
-    let initial_score = objective.score_state(&initial_obj_state);
-    let initial_district_scores = objective.district_scores(&initial_obj_state);
+    // Build initial backend state for writer initialization and worker seeds.
+    let initial_state = backend.init_state(graph, &partition);
+    let initial_score = backend.initial_score(graph, &partition, &initial_state);
+    let initial_district_scores = backend.initial_district_scores(&initial_state);
 
-    // Worker closure: full-score path (ObjectiveConfig is Copy).
-    let obj_fn = move |graph: &Graph, partition: &Partition| -> ScoreValue {
-        objective.score(graph, partition)
-    };
     // Collect per-step partitions only when the stats writer needs every step.
     let collect_trace = !write_best_only;
 
@@ -302,13 +309,16 @@ pub fn multi_short_bursts_with_writer(
             let job_recv = job_recvs[t_idx].clone();
             let result_send = result_send.clone();
             let worker_partition = partition.clone();
+            let worker_backend = backend.clone();
+            let worker_state = initial_state.clone();
 
             scope.spawn(move |_| {
                 run_burst_worker(
                     graph,
                     worker_partition,
+                    worker_state,
                     params.clone(),
-                    obj_fn,
+                    worker_backend,
                     maximize,
                     rng_seed,
                     node_ub,
@@ -326,7 +336,9 @@ pub fn multi_short_bursts_with_writer(
         }
 
         let mut score = initial_score;
-        let mut best_obj_state = initial_obj_state;
+        // Main thread's canonical state, kept in sync with `partition` so the
+        // score writer can report fresh per-district scores after a new best.
+        let mut best_state: B::State = initial_state;
         // Sequential sample number for stats_writer: incremented once per
         // partition emitted to the writer (every step, or every new best).
         let mut writer_step: u64 = 0;
@@ -348,7 +360,7 @@ pub fn multi_short_bursts_with_writer(
                             partition = bp;
                             score = bs;
                             diff = Some(partition.clone());
-                            best_obj_state = objective.init(graph, &partition);
+                            best_state = backend.init_state(graph, &partition);
                             writer_step += 1;
                             if let Some(send) = stats_send.as_ref() {
                                 send.send(BurstStatsPacket {
@@ -383,7 +395,7 @@ pub fn multi_short_bursts_with_writer(
                             partition = stepped_partition;
                             score = stepped_score;
                             diff = Some(partition.clone());
-                            best_obj_state = objective.init(graph, &partition);
+                            best_state = backend.init_state(graph, &partition);
                         }
                     }
                 }
@@ -392,12 +404,12 @@ pub fn multi_short_bursts_with_writer(
             // Score writer fires only when a new global best was found this round.
             if diff.is_some() {
                 if let Some(send) = score_send.as_ref() {
-                    let ds = objective.district_scores(&best_obj_state);
+                    let ds = backend.step_district_scores(&best_state);
                     send.send(BurstScorePacket {
                         step,
                         score,
                         best_score: score,
-                        district_scores: Some(ds),
+                        district_scores: ds,
                         terminate: false,
                     })
                     .unwrap();

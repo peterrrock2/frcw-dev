@@ -14,6 +14,8 @@ pub mod run;
 /// Tilted run optimization.
 pub mod tilted;
 
+pub use tilted::{FullRescoreBackend, IncrementalBackend, ScoringBackend};
+
 /// A lightweight list-of-lists representation of a spanning tree.
 type SpanningTree = Vec<Vec<usize>>;
 

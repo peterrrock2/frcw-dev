@@ -62,17 +62,23 @@ pub trait AcceptanceRule: Send + Copy {
         -> bool;
 }
 
-/// Pluggable scoring strategy for the tilted engine.
+/// Pluggable scoring strategy for ReCom-based optimizers.
 ///
 /// A backend owns whatever per-thread state and scratch buffers it needs to
 /// score candidate proposals and to apply accepted proposals to the chain
-/// state. Two backends ship with the crate:
+/// state. The same trait is used by both the tilted runner (which scores
+/// candidates with temp-apply / score / revert under [`score_candidate`]) and
+/// the short-bursts runner (which always-accepts within a burst and reads
+/// the canonical score back via [`current_score`]).
 ///
-/// - [`FullRescoreBackend`] wraps a closure `Fn(&Graph, &Partition) -> f64`
-///   and rescores from scratch on every candidate via temp-apply / score /
-///   revert.
-/// - [`IncrementalBackend`] wraps an [`IncrementalObjective`] and reads the
-///   score off the cached state without mutating the partition.
+/// Two backends ship with the crate:
+///
+/// - [`super::FullRescoreBackend`] wraps a closure
+///   `Fn(&Graph, &Partition) -> f64` and rescores from scratch on every
+///   candidate.
+/// - [`super::IncrementalBackend`] wraps an
+///   [`crate::objectives::IncrementalObjective`] and reads the score off the
+///   cached state without mutating the partition.
 pub trait ScoringBackend: Send + Clone {
     /// Per-thread cached state. `()` for full-rescore scoring; the cached
     /// objective state for incremental scoring.
@@ -123,6 +129,18 @@ pub trait ScoringBackend: Send + Clone {
     /// Returns per-district scores to forward to the score writer for the
     /// just-accepted step, or `None` to keep replaying the last vector.
     fn step_district_scores(&self, state: &Self::State) -> Option<Vec<f64>>;
+
+    /// Returns the current canonical score from cached state without
+    /// rescoring. For backends whose state already caches the score (e.g.
+    /// `IncrementalBackend`), this is O(1). For backends without caching (e.g.
+    /// `FullRescoreBackend`), the default falls back to a full rescore.
+    ///
+    /// Used by always-accept runners (short bursts) to read the score after
+    /// `apply_accepted` without paying the cost of `score_candidate`'s
+    /// temp-apply / revert dance.
+    fn current_score(&self, graph: &Graph, partition: &Partition, state: &Self::State) -> f64 {
+        self.initial_score(graph, partition, state)
+    }
 }
 
 /// Reusable worker-side buffers for one tilted worker, parameterized on the
