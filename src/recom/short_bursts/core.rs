@@ -18,20 +18,17 @@
 //! tests and ad-hoc explorations can use [`crate::recom::FullRescoreBackend`]
 //! to plug in arbitrary closure objectives.
 use super::super::{
-    cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
-    RecomVariant, ScoringBackend,
+    make_sampler, node_bound, random_split, sample_dist_pair, RecomParams, RecomVariant,
+    ScoringBackend, WorkerBuffers,
 };
 use super::packets::{
     send_burst_batch, terminate_burst_worker, BurstJobPacket, BurstResult, BurstScorePacket,
     BurstStatsPacket,
 };
 use super::writers::{start_burst_score_writer, start_burst_stats_writer};
-use crate::buffers::{
-    graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
-};
+use crate::buffers::graph_connected_buffered;
 use crate::graph::Graph;
 use crate::partition::Partition;
-use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
 use crate::stats::{ScoresWriter, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -45,49 +42,6 @@ const WRITER_CHANNEL_CAPACITY: usize = 128;
 
 /// Public type alias for the score type used by the short-bursts engine.
 pub type ScoreValue = f64;
-
-/// Builds the spanning-tree sampler for the supported variants.
-fn make_sampler(
-    params: &RecomParams,
-    buf_size: usize,
-    rng: &mut SmallRng,
-) -> Box<dyn SpanningTreeSampler> {
-    match params.variant {
-        RecomVariant::DistrictPairsRMST | RecomVariant::CutEdgesRMST => {
-            Box::new(RMSTSampler::new(buf_size))
-        }
-        RecomVariant::DistrictPairsRegionAware | RecomVariant::CutEdgesRegionAware => {
-            let region_weights = params
-                .region_weights
-                .clone()
-                .expect("Region weights required for region-aware ReCom.");
-            Box::new(RegionAwareSampler::new(buf_size, region_weights))
-        }
-        RecomVariant::DistrictPairsUST | RecomVariant::CutEdgesUST => {
-            Box::new(USTSampler::new(buf_size, rng))
-        }
-        RecomVariant::Reversible => {
-            panic!("Reversible ReCom is not supported by the short bursts optimizer.");
-        }
-    }
-}
-
-/// Draws the next candidate district pair. Cut-edge variants pick a pair by
-/// sampling a cut edge; district-pair variants sample uniformly and return
-/// `None` if the pair is non-adjacent.
-fn sample_dist_pair(
-    graph: &Graph,
-    partition: &mut Partition,
-    variant: RecomVariant,
-    rng: &mut SmallRng,
-) -> Option<(usize, usize)> {
-    match variant {
-        RecomVariant::CutEdgesRMST
-        | RecomVariant::CutEdgesUST
-        | RecomVariant::CutEdgesRegionAware => Some(cut_edge_dist_pair(graph, partition, rng)),
-        _ => uniform_dist_pair(graph, partition, rng),
-    }
-}
 
 /// Runs a short-bursts worker thread.
 ///
@@ -117,11 +71,12 @@ fn run_burst_worker<B>(
 {
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
-    let mut subgraph_buf = SubgraphBuffer::new(n, buf_size);
-    let mut st_buf = SpanningTreeBuffer::new(buf_size);
-    let mut split_buf = SplitBuffer::new(buf_size, params.balance_ub as usize);
-    let mut proposal_buf = RecomProposal::new_buffer(buf_size);
-    let mut connectivity_buf = ConnectivityBuffers::new(buf_size);
+    let mut buffers = WorkerBuffers::new(
+        backend.make_scratch(buf_size),
+        n,
+        buf_size,
+        params.balance_ub,
+    );
     let mut st_sampler = make_sampler(&params, buf_size, &mut rng);
 
     let mut next: BurstJobPacket = job_recv.recv().unwrap();
@@ -141,31 +96,31 @@ fn run_burst_worker<B>(
                 continue;
             }
             let (dist_a, dist_b) = dist_pair.unwrap();
-            partition.subgraph(graph, &mut subgraph_buf, dist_a, dist_b);
-            if !graph_connected_buffered(&subgraph_buf.graph, &mut connectivity_buf) {
+            partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
+            if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
                 continue;
             }
             st_sampler.random_spanning_tree_with_parent(
-                &subgraph_buf.graph,
+                &buffers.subgraph.graph,
                 graph,
-                &subgraph_buf.raw_nodes,
-                &mut st_buf,
+                &buffers.subgraph.raw_nodes,
+                &mut buffers.spanning_tree,
                 &mut rng,
             );
             let split = random_split(
-                &subgraph_buf.graph,
+                &buffers.subgraph.graph,
                 graph,
                 &mut rng,
-                &st_buf.st,
+                &buffers.spanning_tree.st,
                 dist_a,
                 dist_b,
-                &mut split_buf,
-                &mut proposal_buf,
-                &subgraph_buf.raw_nodes,
+                &mut buffers.split,
+                &mut buffers.proposal,
+                &buffers.subgraph.raw_nodes,
                 &params,
             );
             if split.is_ok() {
-                backend.apply_accepted(graph, &mut partition, &mut state, &proposal_buf);
+                backend.apply_accepted(graph, &mut partition, &mut state, &buffers.proposal);
                 let score = backend.current_score(graph, &partition, &state);
                 if collect_trace {
                     all_steps.push((partition.clone(), score));
@@ -238,6 +193,12 @@ pub fn multi_short_bursts_with_writer<B>(
 where
     B: ScoringBackend,
 {
+    if params.variant == RecomVariant::Reversible {
+        return Err(
+            "Reversible ReCom is not supported by the short bursts optimizer.".to_string(),
+        );
+    }
+
     let mut step = 1u64;
     let node_ub = node_bound(&graph.pops, params.max_pop);
     let mut job_sends = vec![];

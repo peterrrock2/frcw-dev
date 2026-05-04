@@ -1,7 +1,10 @@
 //! Data structures and algorithms for the recombination (ReCom) Markov chain.
-use crate::buffers::SplitBuffer;
+use crate::buffers::{
+    ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
+};
 use crate::graph::Graph;
 use crate::partition::Partition;
+use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
 use rand::rngs::SmallRng;
 use rand::Rng;
 
@@ -148,6 +151,104 @@ impl RecomProposal {
             }
         }
         return seam;
+    }
+}
+
+/// Reusable per-worker scratch storage for one ReCom worker.
+///
+/// All three runners (vanilla chain, short bursts, tilted) need the same
+/// inner working set: a two-district subgraph buffer, a spanning-tree buffer,
+/// a split workspace, a candidate-proposal buffer, connectivity scratch, and
+/// (for backends that score with temp-apply / revert) a backend-specific
+/// scratch slot. Generic over the scratch type `S` so the vanilla chain (no
+/// scratch needed) instantiates `WorkerBuffers<()>` while optimizers
+/// instantiate `WorkerBuffers<B::Scratch>`.
+pub struct WorkerBuffers<S> {
+    /// Merged two-district subgraph buffer.
+    pub subgraph: SubgraphBuffer,
+    /// Spanning tree storage for the merged subgraph.
+    pub spanning_tree: SpanningTreeBuffer,
+    /// Random split workspace.
+    pub split: SplitBuffer,
+    /// Candidate proposal storage.
+    pub proposal: RecomProposal,
+    /// Backend-specific per-thread scratch buffers (e.g., a revert buffer for
+    /// the full-rescore backend, or `()` for the incremental backend or the
+    /// vanilla chain).
+    pub scratch: S,
+    /// Scratch buffers for connectivity checks.
+    pub connectivity: ConnectivityBuffers,
+}
+
+impl<S> WorkerBuffers<S> {
+    /// Allocates the reusable worker-side buffers.
+    ///
+    /// # Arguments
+    ///
+    /// * `scratch` - Backend-specific per-thread scratch (use `()` for
+    ///   runners with no backend-side scratch).
+    /// * `graph_nodes` - Number of nodes in the full graph.
+    /// * `buf_size` - Capacity for two-district subgraph/proposal buffers.
+    /// * `balance_ub` - Soft upper bound used by reversible split buffers.
+    pub fn new(scratch: S, graph_nodes: usize, buf_size: usize, balance_ub: u32) -> Self {
+        Self {
+            subgraph: SubgraphBuffer::new(graph_nodes, buf_size),
+            spanning_tree: SpanningTreeBuffer::new(buf_size),
+            split: SplitBuffer::new(buf_size, balance_ub as usize),
+            proposal: RecomProposal::new_buffer(buf_size),
+            scratch,
+            connectivity: ConnectivityBuffers::new(buf_size),
+        }
+    }
+}
+
+/// Builds the spanning-tree sampler for any [`RecomVariant`].
+///
+/// Cut-edge and district-pair UST/RMST/region-aware variants each map to
+/// their dedicated sampler; [`RecomVariant::Reversible`] also uses a UST
+/// sampler (matching the legacy behavior in `run.rs`). Optimizers that do
+/// not support reversible chains should reject the variant at their entry
+/// points, not here, so that the precondition error is informative rather
+/// than a delayed worker-thread panic.
+pub(crate) fn make_sampler(
+    params: &RecomParams,
+    buf_size: usize,
+    rng: &mut SmallRng,
+) -> Box<dyn SpanningTreeSampler> {
+    match params.variant {
+        RecomVariant::DistrictPairsRMST | RecomVariant::CutEdgesRMST => {
+            Box::new(RMSTSampler::new(buf_size))
+        }
+        RecomVariant::DistrictPairsRegionAware | RecomVariant::CutEdgesRegionAware => {
+            let region_weights = params
+                .region_weights
+                .clone()
+                .expect("Region weights required for region-aware ReCom.");
+            Box::new(RegionAwareSampler::new(buf_size, region_weights))
+        }
+        RecomVariant::DistrictPairsUST
+        | RecomVariant::CutEdgesUST
+        | RecomVariant::Reversible => Box::new(USTSampler::new(buf_size, rng)),
+    }
+}
+
+/// Draws the next candidate district pair for any [`RecomVariant`].
+///
+/// Cut-edge variants pick a pair by sampling a cut edge (always adjacent).
+/// District-pair variants -- including [`RecomVariant::Reversible`] -- sample
+/// a uniform pair and return `None` if it is non-adjacent, signaling the
+/// caller to either retry (non-reversible) or count a self-loop (reversible).
+pub(crate) fn sample_dist_pair(
+    graph: &Graph,
+    partition: &mut Partition,
+    variant: RecomVariant,
+    rng: &mut SmallRng,
+) -> Option<(usize, usize)> {
+    match variant {
+        RecomVariant::CutEdgesRMST
+        | RecomVariant::CutEdgesUST
+        | RecomVariant::CutEdgesRegionAware => Some(cut_edge_dist_pair(graph, partition, rng)),
+        _ => uniform_dist_pair(graph, partition, rng),
     }
 }
 

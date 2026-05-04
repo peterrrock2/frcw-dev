@@ -19,20 +19,18 @@
 //!
 //! See `docs/tilted_runs_spec.md` for full architecture documentation.
 use super::super::{
-    cut_edge_dist_pair, node_bound, random_split, uniform_dist_pair, RecomParams, RecomProposal,
-    RecomVariant,
+    make_sampler, node_bound, random_split, sample_dist_pair, RecomParams, RecomProposal,
+    RecomVariant, WorkerBuffers,
 };
 use super::packets::{
     collect_tilted_results, send_tilted_jobs, stop_tilted_workers, ScoredProposal,
     TiltedJobPacket, TiltedResultPacket, TiltedScorePacket, TiltedStatsPacket,
 };
 use super::writers::{start_tilted_score_writer, start_tilted_stats_writer};
-use crate::buffers::{
-    graph_connected_buffered, ConnectivityBuffers, SpanningTreeBuffer, SplitBuffer, SubgraphBuffer,
-};
+use crate::buffers::graph_connected_buffered;
 use crate::graph::Graph;
 use crate::partition::Partition;
-use crate::spanning_tree::{RMSTSampler, RegionAwareSampler, SpanningTreeSampler, USTSampler};
+use crate::spanning_tree::SpanningTreeSampler;
 use crate::stats::{ScoresWriter, SelfLoopCounts, SelfLoopReason, StatsWriter};
 use crossbeam::scope;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -140,46 +138,6 @@ pub trait ScoringBackend: Send + Clone {
     /// temp-apply / revert dance.
     fn current_score(&self, graph: &Graph, partition: &Partition, state: &Self::State) -> f64 {
         self.initial_score(graph, partition, state)
-    }
-}
-
-/// Reusable worker-side buffers for one tilted worker, parameterized on the
-/// backend's per-thread scratch type.
-struct TiltedWorkerBuffers<S> {
-    /// Merged two-district subgraph buffer.
-    subgraph: SubgraphBuffer,
-    /// Spanning tree storage for the merged subgraph.
-    spanning_tree: SpanningTreeBuffer,
-    /// Random split workspace.
-    split: SplitBuffer,
-    /// Candidate proposal storage.
-    proposal: RecomProposal,
-    /// Backend-specific per-thread scratch buffers (e.g., a revert buffer for
-    /// the full-rescore backend, or `()` for the incremental backend).
-    scratch: S,
-    /// Scratch buffers for connectivity checks.
-    connectivity: ConnectivityBuffers,
-}
-
-impl<S> TiltedWorkerBuffers<S> {
-    /// Creates the reusable worker-side buffers.
-    ///
-    /// # Arguments
-    ///
-    /// * `scratch` - Backend-specific per-thread scratch produced by
-    ///   [`ScoringBackend::make_scratch`].
-    /// * `graph_nodes` - Number of nodes in the full graph.
-    /// * `buf_size` - Capacity for two-district subgraph/proposal buffers.
-    /// * `balance_ub` - Soft upper bound used by reversible split buffers.
-    fn new(scratch: S, graph_nodes: usize, buf_size: usize, balance_ub: u32) -> Self {
-        Self {
-            subgraph: SubgraphBuffer::new(graph_nodes, buf_size),
-            spanning_tree: SpanningTreeBuffer::new(buf_size),
-            split: SplitBuffer::new(buf_size, balance_ub as usize),
-            proposal: RecomProposal::new_buffer(buf_size),
-            scratch,
-            connectivity: ConnectivityBuffers::new(buf_size),
-        }
     }
 }
 
@@ -325,79 +283,6 @@ impl<S: Send + Clone> TiltedMainState<S> {
     }
 }
 
-/// Builds the spanning-tree sampler for the supported variants.
-///
-/// # Arguments
-///
-/// * `params` - ReCom parameters containing the variant and optional region weights.
-/// * `buf_size` - Capacity used by the sampler's internal buffers.
-/// * `rng` - RNG used to seed samplers that need one (UST).
-fn make_tilted_sampler(
-    params: &RecomParams,
-    buf_size: usize,
-    rng: &mut SmallRng,
-) -> Box<dyn SpanningTreeSampler> {
-    match params.variant {
-        RecomVariant::DistrictPairsRMST | RecomVariant::CutEdgesRMST => {
-            Box::new(RMSTSampler::new(buf_size))
-        }
-        RecomVariant::DistrictPairsRegionAware | RecomVariant::CutEdgesRegionAware => {
-            let region_weights = params
-                .region_weights
-                .clone()
-                .expect("Region weights required for region-aware ReCom.");
-            Box::new(RegionAwareSampler::new(buf_size, region_weights))
-        }
-        RecomVariant::DistrictPairsUST | RecomVariant::CutEdgesUST => {
-            Box::new(USTSampler::new(buf_size, rng))
-        }
-        RecomVariant::Reversible => {
-            panic!("Reversible ReCom is not supported by the tilted run optimizer.");
-        }
-    }
-}
-
-/// Draws the next candidate district pair for a tilted proposal. Cut-edge
-/// variants pick a pair by sampling a cut edge (which always yields an
-/// adjacent pair); district-pair variants sample a pair uniformly and return
-/// `None` if it is non-adjacent, signaling the caller to retry.
-fn sample_tilted_pair(
-    graph: &Graph,
-    partition: &mut Partition,
-    variant: RecomVariant,
-    rng: &mut SmallRng,
-) -> Option<(usize, usize)> {
-    match variant {
-        RecomVariant::CutEdgesRMST
-        | RecomVariant::CutEdgesUST
-        | RecomVariant::CutEdgesRegionAware => Some(cut_edge_dist_pair(graph, partition, rng)),
-        _ => uniform_dist_pair(graph, partition, rng),
-    }
-}
-
-/// Copies the selected district pair into the reusable subgraph buffer.
-///
-/// Region-aware variants do not need region attributes copied onto the
-/// subgraph: the sampler reads them off the parent graph via `raw_nodes`,
-/// and the region-aware cut chooser now does the same via `subgraph_map`.
-///
-/// # Arguments
-///
-/// * `graph` - Full graph associated with `partition`.
-/// * `partition` - Worker-local partition state.
-/// * `buffers` - Worker buffers whose subgraph field is overwritten.
-/// * `dist_a` - First selected district label.
-/// * `dist_b` - Second selected district label.
-fn fill_pair_subgraph<S>(
-    graph: &Graph,
-    partition: &Partition,
-    buffers: &mut TiltedWorkerBuffers<S>,
-    dist_a: usize,
-    dist_b: usize,
-) {
-    partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
-}
-
 /// Interleaves one batch of worker rejections/proposals into the sequential chain.
 ///
 /// Rejections increment the chain step without changing state. Accepted proposals
@@ -511,7 +396,7 @@ fn draw_tilted_result<B, R>(
     partition: &mut Partition,
     state: &B::State,
     params: &RecomParams,
-    buffers: &mut TiltedWorkerBuffers<B::Scratch>,
+    buffers: &mut WorkerBuffers<B::Scratch>,
     st_sampler: &mut Box<dyn SpanningTreeSampler>,
     backend: &B,
     current_score: f64,
@@ -524,12 +409,12 @@ where
     R: AcceptanceRule,
 {
     loop {
-        let Some((dist_a, dist_b)) = sample_tilted_pair(graph, partition, params.variant, rng)
+        let Some((dist_a, dist_b)) = sample_dist_pair(graph, partition, params.variant, rng)
         else {
             continue;
         };
 
-        fill_pair_subgraph(graph, partition, buffers, dist_a, dist_b);
+        partition.subgraph(graph, &mut buffers.subgraph, dist_a, dist_b);
 
         if !graph_connected_buffered(&buffers.subgraph.graph, &mut buffers.connectivity) {
             continue;
@@ -608,13 +493,13 @@ fn start_tilted_worker<B, R>(
 {
     let n = graph.pops.len();
     let mut rng: SmallRng = SeedableRng::seed_from_u64(rng_seed);
-    let mut buffers = TiltedWorkerBuffers::new(
+    let mut buffers = WorkerBuffers::new(
         backend.make_scratch(buf_size),
         n,
         buf_size,
         params.balance_ub,
     );
-    let mut st_sampler = make_tilted_sampler(&params, buf_size, &mut rng);
+    let mut st_sampler = make_sampler(&params, buf_size, &mut rng);
 
     let mut next: TiltedJobPacket = job_recv.recv().unwrap();
     while !next.terminate {
@@ -680,6 +565,9 @@ where
 {
     if n_threads == 0 {
         return Err("n_threads must be at least 1".to_string());
+    }
+    if params.variant == RecomVariant::Reversible {
+        return Err("Reversible ReCom is not supported by the tilted run optimizer.".to_string());
     }
 
     let node_ub = node_bound(&graph.pops, params.max_pop);
